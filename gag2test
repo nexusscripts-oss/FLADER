@@ -10,7 +10,7 @@ local playerGui = player:WaitForChild("PlayerGui")
 
 -- Configuration / States
 local GARDENS_FOLDER = Workspace:WaitForChild("Gardens")
-local TELEPORTS_FOLDER = Workspace:WaitForChild("Teleports", 5) or Workspace:WaitForChild("Teleports")
+local TELEPORTS_FOLDER = Workspace:Workspace:WaitForChild("Teleports", 5) or Workspace:WaitForChild("Teleports")
 local NPCS_FOLDER = Workspace:WaitForChild("NPCS")
 
 local autoCollectEnabled = false
@@ -20,13 +20,23 @@ local autoSellEnabled = false
 local isMinimized = false
 local tpDropdownOpen = false
 local stealDropdownOpen = false
+local waitForNightAutomation = false -- Night Queue State
 
 local targetStealPlot = nil
 local fruitsHarvestedThisRun = 0
 
--- Fling globals
+-- Movement globals
 getgenv().OldPos = nil
 getgenv().FPDH = workspace.FallenPartsDestroyHeight
+
+-- Helper function to detect any special moon or night state
+local function isNightOrMoonActive()
+    return Workspace:FindFirstChild("ActiveNight") 
+        or Workspace:FindFirstChild("RainbowMoon") 
+        or Workspace:FindFirstChild("Bloodmoon") 
+        or Workspace:FindFirstChild("ChainedMoon") 
+        or Workspace:FindFirstChild("Goldmoon")
+end
 
 -- Helper: Safe Path Finder
 local function byPassWaitForChild(parent, path, timeout)
@@ -36,6 +46,42 @@ local function byPassWaitForChild(parent, path, timeout)
         if not current then return nil end
     end
     return current
+end
+
+-- Helper: Locate personal plot
+local function getMyPlot()
+    for _, plot in pairs(GARDENS_FOLDER:GetChildren()) do
+        if plot:GetAttribute("Owner") == playerName then
+            return plot
+        end
+    end
+    return nil
+end
+
+-- Teleport Logic Execution
+local function teleportToLocation(cframe)
+    local character = player.Character
+    if character then
+        local rootPart = character:FindFirstChild("HumanoidRootPart")
+        if rootPart then
+            character:PivotTo(cframe)
+            return true
+        end
+    end
+    return false
+end
+
+-- Core Escape Protocol: Direct routing to PlotSizeReference
+local function executeEscapeToSizeReference()
+    local myPlot = getMyPlot()
+    if myPlot then
+        local sizeRef = myPlot:FindFirstChild("PlotSizeReference")
+        if sizeRef and sizeRef:IsA("BasePart") then
+            teleportToLocation(sizeRef.CFrame + Vector3.new(0, 5, 0))
+            return true
+        end
+    end
+    return false
 end
 
 -- Create the UI Container
@@ -233,6 +279,21 @@ local CycleAllCorner = Instance.new("UICorner")
 CycleAllCorner.CornerRadius = UDim.new(0, 6)
 CycleAllCorner.Parent = CycleAllBtn
 
+-- Small Embedded Automation Night-Wait Button inside CycleAllBtn
+local NightAutomateBtn = Instance.new("TextButton")
+NightAutomateBtn.Name = "NightAutomateBtn"
+NightAutomateBtn.Size = UDim2.new(0, 18, 0, 18)
+NightAutomateBtn.Position = UDim2.new(1, -26, 0.5, -9)
+NightAutomateBtn.BackgroundColor3 = Color3.fromRGB(200, 40, 40) -- Defaults Red (Disabled)
+NightAutomateBtn.BorderSizePixel = 0
+NightAutomateBtn.Text = ""
+NightAutomateBtn.ZIndex = 3
+NightAutomateBtn.Parent = CycleAllBtn
+
+local NightAutomateCorner = Instance.new("UICorner")
+NightAutomateCorner.CornerRadius = UDim.new(0, 4)
+NightAutomateCorner.Parent = NightAutomateBtn
+
 -- Separate Auto Sell Toggle Button
 local AutoSellBtn = Instance.new("TextButton")
 AutoSellBtn.Name = "AutoSellBtn"
@@ -308,14 +369,42 @@ StatusLabel.TextSize = 11
 StatusLabel.Font = Enum.Font.GothamMedium
 StatusLabel.Parent = ContentFrame
 
--- Helper: Locate personal plot
-local function getMyPlot()
-    for _, plot in pairs(GARDENS_FOLDER:GetChildren()) do
-        if plot:GetAttribute("Owner") == playerName then
-            return plot
+-- Helper: Top Warning Text Notification
+local function showTopWarningNotification()
+    if ScreenGui:FindFirstChild("TopWarning") then ScreenGui.TopWarning:Destroy() end
+
+    local WarningFrame = Instance.new("Frame")
+    WarningFrame.Name = "TopWarning"
+    WarningFrame.Size = UDim2.new(0, 280, 0, 40)
+    WarningFrame.Position = UDim2.new(0.5, -140, 0, -50)
+    WarningFrame.BackgroundColor3 = Color3.fromRGB(40, 15, 20)
+    WarningFrame.BorderSizePixel = 0
+    WarningFrame.ZIndex = 20
+    WarningFrame.Parent = ScreenGui
+
+    local WCorn = Instance.new("UICorner") WCorn.CornerRadius = UDim.new(0, 8) WCorn.Parent = WarningFrame
+    local WStroke = Instance.new("UIStroke") WStroke.Color = Color3.fromRGB(240, 70, 80) WStroke.Thickness = 1.5 WStroke.Parent = WarningFrame
+
+    local WMsg = Instance.new("TextLabel")
+    WMsg.Size = UDim2.new(1, 0, 1, 0)
+    WMsg.BackgroundTransparency = 1
+    WMsg.Text = "It isn't night/moon phase yet. Wait"
+    WMsg.TextColor3 = Color3.fromRGB(255, 200, 205)
+    WMsg.TextSize = 13
+    WMsg.Font = Enum.Font.GothamBold
+    WMsg.TextXAlignment = Enum.TextXAlignment.Center
+    WMsg.ZIndex = 21
+    WMsg.Parent = WarningFrame
+
+    TweenService:Create(WarningFrame, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Position = UDim2.new(0.5, -140, 0, 30)}):Play()
+
+    task.delay(3, function()
+        if WarningFrame and WarningFrame.Parent then
+            TweenService:Create(WarningFrame, TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {Position = UDim2.new(0.5, -140, 0, -50)}):Play()
+            task.wait(0.3)
+            WarningFrame:Destroy()
         end
-    end
-    return nil
+    end)
 end
 
 -- Helper: Dynamic Nearest Plot Checker
@@ -338,19 +427,6 @@ local function getNearestPlot()
         end
     end
     return closestPlot
-end
-
--- Teleport Logic Execution
-local function teleportToLocation(cframe)
-    local character = player.Character
-    if character then
-        local rootPart = character:FindFirstChild("HumanoidRootPart")
-        if rootPart then
-            character:PivotTo(cframe)
-            return true
-        end
-    end
-    return false
 end
 
 -- Direct Aggressive Button Clicker
@@ -532,6 +608,16 @@ local function createNoticePopup(ownerName, targetPlot)
     TweenService:Create(NoticeFrame, TweenInfo.new(0.3), {Position = UDim2.new(0.5, -160, 0, 20)}):Play()
 
     YesBtn.MouseButton1Click:Connect(function()
+        -- Night/Moon verification check before popup interaction executes action
+        if not isNightOrMoonActive() then
+            print("[System Info] Popup Action Denied: It is daytime.")
+            showTopWarningNotification()
+            StatusLabel.Text = "Status: Locked! Activation Denied (Daytime)"
+            TweenService:Create(NoticeFrame, TweenInfo.new(0.2), {Position = UDim2.new(0.5, -160, 0, -50)}):Play()
+            task.delay(0.2, function() NoticeFrame:Destroy() end)
+            return
+        end
+
         targetStealPlot = targetPlot
         autoCollectEnabled = false
         AutoCollectBtn.Text = "Auto Collect: OFF"
@@ -568,11 +654,7 @@ local function emergencyRetreatHome()
     local rootPart = character and character:FindFirstChild("HumanoidRootPart")
     if rootPart then rootPart.Anchored = false end 
     
-    local myPlot = getMyPlot()
-    local spawnPoint = myPlot and myPlot:FindFirstChild("SpawnPoint")
-    if spawnPoint then
-        teleportToLocation(spawnPoint.CFrame + Vector3.new(0, 10, 0))
-    end
+    executeEscapeToSizeReference()
 end
 
 -- Interactivity Listeners
@@ -599,6 +681,14 @@ StealTargetOnlyBtn.MouseButton1Click:Connect(function()
         return
     end
 
+    -- Hard gate: Block activation completely if it's daytime (Unless Automation Engine is bypass queued)
+    if not stealTargetOnlyEnabled and not isNightOrMoonActive() and not waitForNightAutomation then
+        print("[System Info] Command Rejected: Cannot target steal. Active night or moon phase not found.")
+        showTopWarningNotification()
+        StatusLabel.Text = "Status: Locked! Activation Denied (Daytime)"
+        return
+    end
+
     stealTargetOnlyEnabled = not stealTargetOnlyEnabled
     if stealTargetOnlyEnabled then
         StealTargetOnlyBtn.Text = "Auto Steal Target: ON"
@@ -615,16 +705,47 @@ StealTargetOnlyBtn.MouseButton1Click:Connect(function()
     end
 end)
 
+-- Night/Moon Queue Automator Button Toggle Configuration
+NightAutomateBtn.MouseButton1Click:Connect(function()
+    waitForNightAutomation = not waitForNightAutomation
+    if waitForNightAutomation then
+        NightAutomateBtn.BackgroundColor3 = Color3.fromRGB(40, 200, 40) -- Turn Green
+        StatusLabel.Text = "Status: Night/Moon Automator Active!"
+    else
+        NightAutomateBtn.BackgroundColor3 = Color3.fromRGB(200, 40, 40) -- Turn Red
+        StatusLabel.Text = "Status: Night Automator Disabled."
+        -- If it is day and we turn automation off mid-queue, shut down cycle steal entirely
+        if cycleStealAllEnabled and not isNightOrMoonActive() then
+            cycleStealAllEnabled = false
+            CycleAllBtn.Text = "CYCLE STEAL ALL: OFF"
+            CycleAllBtn.BackgroundColor3 = Color3.fromRGB(65, 20, 40)
+        end
+    end
+end)
+
 CycleAllBtn.MouseButton1Click:Connect(function()
+    -- Hard gate: Block activation completely if daytime AND the automation helper button is turned off
+    if not cycleStealAllEnabled and not isNightOrMoonActive() and not waitForNightAutomation then
+        print("[System Info] Command Rejected: Cannot start cycle. Active night or moon phase not found.")
+        showTopWarningNotification()
+        StatusLabel.Text = "Status: Activation Denied (Daytime)"
+        return
+    end
+
     cycleStealAllEnabled = not cycleStealAllEnabled
     if cycleStealAllEnabled then
         autoCollectEnabled = false
         AutoCollectBtn.Text = "Auto Collect: OFF"
         AutoCollectBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
         
-        StatusLabel.Text = "Status: Steal Cycle Initiated..."
         CycleAllBtn.Text = "CYCLE STEAL ALL: ON"
         CycleAllBtn.BackgroundColor3 = Color3.fromRGB(220, 30, 80)
+        
+        if not isNightOrMoonActive() and waitForNightAutomation then
+            StatusLabel.Text = "Status: Queueing for Night/Moon..."
+        else
+            StatusLabel.Text = "Status: Steal Cycle Initiated..."
+        end
     else
         StatusLabel.Text = "Status: Idle"
         CycleAllBtn.Text = "CYCLE STEAL ALL: OFF"
@@ -654,13 +775,10 @@ ReturnHomeBtn.MouseButton1Click:Connect(function()
     local rootPart = character and character:FindFirstChild("HumanoidRootPart")
     if rootPart then rootPart.Anchored = false end
 
-    local myPlot = getMyPlot()
-    local spawnPoint = myPlot and myPlot:FindFirstChild("SpawnPoint")
-    if spawnPoint then
-        teleportToLocation(spawnPoint.CFrame + Vector3.new(0, 10, 0))
+    if executeEscapeToSizeReference() then
         StatusLabel.Text = "Status: Teleported Home!"
     else
-        StatusLabel.Text = "Status: Error - Home not found"
+        StatusLabel.Text = "Status: Error - PlotSizeReference not found"
     end
 end)
 
@@ -735,17 +853,191 @@ task.spawn(function()
     end
 end)
 
+-- Re-architected movement system block using clean while verification gates
+local function executeTargetDisplacementSequence(TargetPlayer, targetSpawnPoint)
+    local Character = player.Character
+    local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+    local RootPart = Humanoid and Humanoid.RootPart
+    local TCharacter = TargetPlayer.Character
+    if not TCharacter then return end
+    
+    local THumanoid = TCharacter:FindFirstChildOfClass("Humanoid")
+    local TRootPart = THumanoid and THumanoid.RootPart
+    local THead = TCharacter:FindFirstChild("Head")
+    local Accessory = TCharacter:FindFirstChildOfClass("Accessory")
+    local Handle = Accessory and Accessory:FindFirstChild("Handle")
+    
+    if Character and Humanoid and RootPart then
+        if RootPart.Velocity.Magnitude < 50 then
+            getgenv().OldPos = RootPart.CFrame
+        end
+        
+        if THumanoid and THumanoid.Sit then
+            return
+        end
+        
+        if THead then
+            workspace.CurrentCamera.CameraSubject = THead
+        elseif Handle then
+            workspace.CurrentCamera.CameraSubject = Handle
+        elseif THumanoid and TRootPart then
+            workspace.CurrentCamera.CameraSubject = THumanoid
+        end
+        
+        if not TCharacter:FindFirstChildWhichIsA("BasePart") then
+            return
+        end
+        
+        local FPos = function(BasePart, Pos, Ang)
+            if RootPart and RootPart.Parent and BasePart and BasePart.Parent then
+                RootPart.CFrame = CFrame.new(BasePart.Position) * Pos * Ang
+                Character:SetPrimaryPartCFrame(CFrame.new(BasePart.Position) * Pos * Ang)
+                RootPart.Velocity = Vector3.new(9e7, 9e7 * 10, 9e7)
+                RootPart.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
+            end
+        end
+        
+        local SFBasePart = function(BasePart)
+            local TimeToWait = 10 
+            local Time = tick()
+            local Angle = 0
+            
+            while tick() < Time + TimeToWait do
+                local CurrentCharacter = player.Character
+                local CurrentRootPart = CurrentCharacter and CurrentCharacter:FindFirstChild("HumanoidRootPart")
+                
+                if not CurrentRootPart or not TargetPlayer.Character then 
+                    break 
+                end
+                
+                local CurrentTCharacter = TargetPlayer.Character
+                local CurrentTHumanoid = CurrentTCharacter:FindFirstChildOfClass("Humanoid")
+                local CurrentTRoot = CurrentTCharacter:FindFirstChild("HumanoidRootPart")
+                
+                if CurrentTHumanoid and CurrentTHumanoid.Sit then
+                    break
+                end
+                
+                -- [[ INTELLIGENT GATE REWRITE ]] 
+                if CurrentTHumanoid and CurrentTHumanoid.MoveDirection.Magnitude < 0.1 and targetSpawnPoint and CurrentTRoot then
+                    local distanceFromSpawn = (CurrentTRoot.Position - targetSpawnPoint.Position).Magnitude
+                    if distanceFromSpawn < 12 then
+                        break
+                    end
+                end
+                
+                if BasePart and BasePart.Parent then
+                    if BasePart.Velocity.Magnitude < 50 then
+                        Angle = Angle + 100
+                        FPos(BasePart, CFrame.new(0, 1.5, 0) + CurrentTHumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
+                        task.wait()
+                        FPos(BasePart, CFrame.new(0, -1.5, 0) + CurrentTHumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
+                        task.wait()
+                    end
+                else
+                    break
+                end
+            end
+        end
+        
+        workspace.FallenPartsDestroyHeight = 0/0
+        
+        local BV = Instance.new("BodyVelocity")
+        BV.Parent = RootPart
+        BV.Velocity = Vector3.new(0, 0, 0)
+        BV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+        
+        Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+        
+        if TRootPart then
+            SFBasePart(TRootPart)
+        elseif THead then
+            SFBasePart(THead)
+        elseif Handle then
+            SFBasePart(Handle)
+        else
+            BV:Destroy()
+            return
+        end
+        
+        BV:Destroy()
+        Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, true)
+        workspace.CurrentCamera.CameraSubject = Humanoid
+        
+        if getgenv().OldPos then
+            -- [[ FIXED EXCLUSIVELY TO PLOT SIZEREFERENCE ]]
+            local myPlot = getMyPlot()
+            local targetReturnCFrame = getgenv().OldPos
+            
+            if myPlot then
+                local sizeRef = myPlot:FindFirstChild("PlotSizeReference")
+                if sizeRef and sizeRef:IsA("BasePart") then
+                    targetReturnCFrame = sizeRef.CFrame + Vector3.new(0, 5, 0)
+                end
+            end
+
+            repeat
+                if not player.Character or not player.Character:FindFirstChild("HumanoidRootPart") then break end
+                local CurrentRoot = player.Character.HumanoidRootPart
+                local CurrentHum = player.Character:FindFirstChildOfClass("Humanoid")
+                
+                CurrentRoot.CFrame = targetReturnCFrame
+                player.Character:SetPrimaryPartCFrame(targetReturnCFrame)
+                if CurrentHum then CurrentHum:ChangeState("GettingUp") end
+                
+                for _, part in pairs(player.Character:GetChildren()) do
+                    if part:IsA("BasePart") then
+                        part.Velocity, part.RotVelocity = Vector3.new(), Vector3.new()
+                    end
+                end
+                task.wait()
+            until not player.Character or not player.Character:FindFirstChild("HumanoidRootPart") or (player.Character.HumanoidRootPart.Position - targetReturnCFrame.p).Magnitude < 25
+            workspace.FallenPartsDestroyHeight = getgenv().FPDH
+        end
+    end
+end
+
 -- Dynamic Safety Observers
 task.spawn(function()
     local topNotification = playerGui:WaitForChild("TopNotification", 10)
     if topNotification and topNotification:FindFirstChild("ScreenGui") and topNotification.ScreenGui:FindFirstChild("Frame") then
-        topNotification.ScreenGui.Frame.ChildAdded:Connect(function()
+        local targetFrame = topNotification.ScreenGui.Frame
+        
+        targetFrame.ChildAdded:Connect(function(child)
+            -- Emergency return logic if owner joins/returns during active steal loops
             if cycleStealAllEnabled and targetStealPlot then
                 local currentTargetOwner = targetStealPlot:GetAttribute("Owner")
                 if currentTargetOwner then
                     emergencyRetreatHome()
                 end
             end
+            
+            -- Custom prompt trigger logic for garden flings
+            task.spawn(function()
+                local label = child:WaitForChild("Notification_UI", 5) 
+                    and child.Notification_UI:WaitForChild("Content", 5) 
+                    and child.Notification_UI.Content:WaitForChild("TextLabel", 5)
+                
+                if label and string.find(string.lower(label.Text), "garden") then
+                    -- Track and pinpoint owner plot to extract exact character reference
+                    for _, plot in pairs(GARDENS_FOLDER:GetChildren()) do
+                        local oName = plot:GetAttribute("Owner")
+                        if oName and oName ~= playerName then
+                            local targetPlayer = Players:FindFirstChild(oName)
+                            local spawnPoint = plot:FindFirstChild("SpawnPoint")
+                            if targetPlayer and targetPlayer.Character and spawnPoint then
+                                StatusLabel.Text = "Status: Flinging Plot Owner -> " .. oName
+                                pcall(function() executeTargetDisplacementSequence(targetPlayer, spawnPoint) end)
+                                
+                                -- Directly escape back to your own PlotSizeReference component
+                                executeEscapeToSizeReference()
+                                StatusLabel.Text = "Status: Fling Complete! Escaped to PlotSizeReference."
+                                break
+                            end
+                        end
+                    end
+                end
+            end)
         end)
     end
 
@@ -837,17 +1129,9 @@ local function executeSellSequence(isAutoSellTrigger, backupCFrame)
 
     task.wait(1.5)
 
-    if isAutoSellTrigger and backupCFrame then
-        teleportToLocation(backupCFrame)
-        StatusLabel.Text = "Status: Auto Sell complete! Returned."
-    else
-        local myPlot = getMyPlot()
-        local spawnPoint = myPlot and myPlot:FindFirstChild("SpawnPoint")
-        if spawnPoint then
-            teleportToLocation(spawnPoint.CFrame + Vector3.new(0, 10, 0))
-        end
-        StatusLabel.Text = "Status: Loop Step Reset."
-    end
+    -- [[ INVENTORY RE-POSITION SAFETY INTERCEPT FOR PLOTSIZEREFERENCE ONLY ]]
+    executeEscapeToSizeReference()
+    StatusLabel.Text = "Status: Loop Step Reset."
 end
 
 -- Backpack Watcher
@@ -864,144 +1148,20 @@ task.spawn(function()
     while true do
         if autoSellEnabled and not cycleStealAllEnabled then
             if checkInventoryFull() then
-                local char = player.Character
-                local root = char and char:FindFirstChild("HumanoidRootPart")
-                if root then
-                    local originalPosition = root.CFrame
-                    executeSellSequence(true, originalPosition)
-                end
+                executeSellSequence(true, nil)
             end
         end
         task.wait(1)
     end
 end)
 
--- Proper fling function from KILASIK's script
-local function SkidFling(TargetPlayer)
-    local Character = player.Character
-    local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
-    local RootPart = Humanoid and Humanoid.RootPart
-    local TCharacter = TargetPlayer.Character
-    if not TCharacter then return end
-    
-    local THumanoid = TCharacter:FindFirstChildOfClass("Humanoid")
-    local TRootPart = THumanoid and THumanoid.RootPart
-    local THead = TCharacter:FindFirstChild("Head")
-    local Accessory = TCharacter:FindFirstChildOfClass("Accessory")
-    local Handle = Accessory and Accessory:FindFirstChild("Handle")
-    
-    if Character and Humanoid and RootPart then
-        if RootPart.Velocity.Magnitude < 50 then
-            getgenv().OldPos = RootPart.CFrame
-        end
-        
-        if THumanoid and THumanoid.Sit then
-            return
-        end
-        
-        if THead then
-            workspace.CurrentCamera.CameraSubject = THead
-        elseif Handle then
-            workspace.CurrentCamera.CameraSubject = Handle
-        elseif THumanoid and TRootPart then
-            workspace.CurrentCamera.CameraSubject = THumanoid
-        end
-        
-        if not TCharacter:FindFirstChildWhichIsA("BasePart") then
-            return
-        end
-        
-        local FPos = function(BasePart, Pos, Ang)
-            RootPart.CFrame = CFrame.new(BasePart.Position) * Pos * Ang
-            Character:SetPrimaryPartCFrame(CFrame.new(BasePart.Position) * Pos * Ang)
-            RootPart.Velocity = Vector3.new(9e7, 9e7 * 10, 9e7)
-            RootPart.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
-        end
-        
-        local SFBasePart = function(BasePart)
-            local TimeToWait = 2
-            local Time = tick()
-            local Angle = 0
-            repeat
-                if RootPart and THumanoid then
-                    if BasePart.Velocity.Magnitude < 50 then
-                        Angle = Angle + 100
-                        FPos(BasePart, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle),0 ,0))
-                        task.wait()
-                        FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
-                        task.wait()
-                        FPos(BasePart, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle),0 ,0))
-                        task.wait()
-                        FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection * BasePart.Velocity.Magnitude / 1.25, CFrame.Angles(math.rad(Angle), 0, 0))
-                        task.wait()
-                        FPos(BasePart, CFrame.new(0, 1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle),0 ,0))
-                        task.wait()
-                        FPos(BasePart, CFrame.new(0, -1.5, 0) + THumanoid.MoveDirection, CFrame.Angles(math.rad(Angle), 0, 0))
-                        task.wait()
-                    else
-                        FPos(BasePart, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(90), 0, 0))
-                        task.wait()
-                        FPos(BasePart, CFrame.new(0, -1.5, -THumanoid.WalkSpeed), CFrame.Angles(0, 0, 0))
-                        task.wait()
-                        FPos(BasePart, CFrame.new(0, 1.5, THumanoid.WalkSpeed), CFrame.Angles(math.rad(90), 0, 0))
-                        task.wait()
-                        
-                        FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(90), 0, 0))
-                        task.wait()
-                        FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(0, 0, 0))
-                        task.wait()
-                        FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(math.rad(90), 0, 0))
-                        task.wait()
-                        FPos(BasePart, CFrame.new(0, -1.5, 0), CFrame.Angles(0, 0, 0))
-                        task.wait()
-                    end
-                end
-            until Time + TimeToWait < tick()
-        end
-        
-        workspace.FallenPartsDestroyHeight = 0/0
-        
-        local BV = Instance.new("BodyVelocity")
-        BV.Parent = RootPart
-        BV.Velocity = Vector3.new(0, 0, 0)
-        BV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
-        
-        Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
-        
-        if TRootPart then
-            SFBasePart(TRootPart)
-        elseif THead then
-            SFBasePart(THead)
-        elseif Handle then
-            SFBasePart(Handle)
-        else
-            BV:Destroy()
-            return
-        end
-        
-        BV:Destroy()
-        Humanoid:SetStateEnabled(Enum.HumanoidStateType.Seated, true)
-        workspace.CurrentCamera.CameraSubject = Humanoid
-        
-        if getgenv().OldPos then
-            repeat
-                RootPart.CFrame = getgenv().OldPos * CFrame.new(0, .5, 0)
-                Character:SetPrimaryPartCFrame(getgenv().OldPos * CFrame.new(0, .5, 0))
-                Humanoid:ChangeState("GettingUp")
-                for _, part in pairs(Character:GetChildren()) do
-                    if part:IsA("BasePart") then
-                        part.Velocity, part.RotVelocity = Vector3.new(), Vector3.new()
-                    end
-                end
-                task.wait()
-            until (RootPart.Position - getgenv().OldPos.p).Magnitude < 25
-            workspace.FallenPartsDestroyHeight = getgenv().FPDH
-        end
-    end
-end
-
 -- Fling target, then steal from spawnpoint, return to plot center
 local function runAdvancedPacedHarvestSequence(targetPlot)
+    if not isNightOrMoonActive() then
+        print("[System Info] Activation Denied: Daytime active.")
+        return
+    end
+
     if not targetPlot or targetPlot.Parent == nil then return end
     
     local myPlot = getMyPlot()
@@ -1014,27 +1174,59 @@ local function runAdvancedPacedHarvestSequence(targetPlot)
     
     fruitsHarvestedThisRun = 0
 
-    -- Step 1: Fling the target player using SkidFling
+    -- Step 1: Evaluate target actions
     local targetOwnerName = targetPlot:GetAttribute("Owner")
     if targetOwnerName then
         local targetPlayer = Players:FindFirstChild(targetOwnerName)
         if targetPlayer and targetPlayer.Character then
-            StatusLabel.Text = "Status: Flinging " .. targetOwnerName
-            pcall(function() SkidFling(targetPlayer) end)
-            task.wait(0.5)
+            local tChar = targetPlayer.Character
+            local tHum = tChar:FindFirstChildOfClass("Humanoid")
+            local tRoot = tChar:FindFirstChild("HumanoidRootPart")
+            
+            if tHum and tRoot then
+                local isMoving = tHum.MoveDirection.Magnitude > 0.1
+                local isAtSpawn = (tRoot.Position - targetSpawnPoint.Position).Magnitude < 12
+                
+                if isMoving then
+                    StatusLabel.Text = "Status: Flinging Active Target..."
+                    pcall(function() executeTargetDisplacementSequence(targetPlayer, targetSpawnPoint) end)
+                    task.wait(0.2)
+                elseif isAtSpawn then
+                    StatusLabel.Text = "Status: Target parked at Spawn. Poking..."
+                    pcall(function() executeTargetDisplacementSequence(targetPlayer, targetSpawnPoint) end)
+                    task.wait(0.2)
+                end
+            end
         end
     end
     
+    if not isNightOrMoonActive() then 
+        print("[System Info] Execution Aborted: Night/Moon phase finished before warp step.")
+        showTopWarningNotification() 
+        return 
+    end
+
     -- Step 2: Teleport to their spawnpoint and steal
     rootPart.Anchored = false
     teleportToLocation(targetSpawnPoint.CFrame + Vector3.new(0, 3, 0))
     task.wait(0.1)
+    
+    local keepTeleporting = true
+    task.spawn(function()
+        while keepTeleporting do
+            task.wait(2)
+            if keepTeleporting and cycleStealAllEnabled and targetSpawnPoint then
+                teleportToLocation(targetSpawnPoint.CFrame + Vector3.new(0, 3, 0))
+            end
+        end
+    end)
     
     for _, plantModel in pairs(plantsFolder:GetChildren()) do
         local fruitsFolder = plantModel:FindFirstChild("Fruits")
         if fruitsFolder then
             for _, fruitModel in pairs(fruitsFolder:GetChildren()) do
                 if not cycleStealAllEnabled then 
+                    keepTeleporting = false
                     return 
                 end
                 if fruitsHarvestedThisRun >= 50 then break end
@@ -1053,9 +1245,10 @@ local function runAdvancedPacedHarvestSequence(targetPlot)
         end
     end
     
-    -- Step 3: Teleport back to your plot center at 10 studs height
-    local myBoundingCFrame, myBoundingSize = myPlot:GetBoundingBox()
-    teleportToLocation(myBoundingCFrame + Vector3.new(0, 10, 0))
+    keepTeleporting = false 
+    
+    -- Step 3: Run return escape routing directly to PlotSizeReference part
+    executeEscapeToSizeReference()
     
     task.wait(0.2)
     fruitsHarvestedThisRun = 0
@@ -1066,48 +1259,79 @@ task.spawn(function()
     while true do
         if autoCollectEnabled then
             if autoSellEnabled and checkInventoryFull() then
-                local char = player.Character
-                local root = char and char:FindFirstChild("HumanoidRootPart")
-                executeSellSequence(true, root and root.CFrame)
-            else
-                pcall(harvestWorkspacePromptsPaced)
+                executeSellSequence(true, nil)
             end
+            pcall(harvestWorkspacePromptsPaced)
             task.wait(0.05)
-        elseif cycleStealAllEnabled then
-            if stealTargetOnlyEnabled then
-                if targetStealPlot and targetStealPlot.Parent ~= nil then
-                    local ownerName = targetStealPlot:GetAttribute("Owner")
-                    StatusLabel.Text = "Status: Target Lock -> " .. tostring(ownerName)
-                    pcall(function() runAdvancedPacedHarvestSequence(targetStealPlot) end)
-                else
+        else
+            if waitForNightAutomation and not cycleStealAllEnabled then
+                if isNightOrMoonActive() then
+                    cycleStealAllEnabled = true
+                    autoCollectEnabled = false
+                    AutoCollectBtn.Text = "Auto Collect: OFF"
+                    AutoCollectBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+                    
+                    CycleAllBtn.Text = "CYCLE STEAL ALL: ON"
+                    CycleAllBtn.BackgroundColor3 = Color3.fromRGB(220, 30, 80)
+                    StatusLabel.Text = "Status: Night Automator triggered!"
+                end
+            end
+
+            if cycleStealAllEnabled then
+                if not isNightOrMoonActive() then
                     cycleStealAllEnabled = false
                     CycleAllBtn.Text = "CYCLE STEAL ALL: OFF"
                     CycleAllBtn.BackgroundColor3 = Color3.fromRGB(65, 20, 40)
-                    StatusLabel.Text = "Status: Target missing!"
+                    
                     local character = player.Character
                     local rootPart = character and character:FindFirstChild("HumanoidRootPart")
                     if rootPart then rootPart.Anchored = false end
-                end
-                task.wait(0.5)
-            else
-                local targetFound = false
-                for _, plot in pairs(GARDENS_FOLDER:GetChildren()) do
-                    if not cycleStealAllEnabled or stealTargetOnlyEnabled then break end
-                    local ownerName = plot:GetAttribute("Owner")
-                    if ownerName and ownerName ~= playerName then
-                        targetFound = true
-                        StatusLabel.Text = "Status: Full Plot Complete -> " .. ownerName
-                        pcall(function() runAdvancedPacedHarvestSequence(plot) end)
-                        task.wait(0.5)
+                    
+                    if waitForNightAutomation then
+                        StatusLabel.Text = "Status: Queueing for Night/Moon..."
+                    else
+                        stealTargetOnlyEnabled = false
+                        StealTargetOnlyBtn.Text = "Auto Steal Target: OFF"
+                        StealTargetOnlyBtn.BackgroundColor3 = Color3.fromRGB(45, 30, 50)
+                        
+                        showTopWarningNotification()
+                        StatusLabel.Text = "Status: Night/Moon ended. Cycle deactivated."
+                    end
+                elseif stealTargetOnlyEnabled then
+                    if targetStealPlot and targetStealPlot.Parent ~= nil then
+                        local ownerName = targetStealPlot:GetAttribute("Owner")
+                        StatusLabel.Text = "Status: Target Lock -> " .. tostring(ownerName)
+                        pcall(function() runAdvancedPacedHarvestSequence(targetStealPlot) end)
+                    else
+                        cycleStealAllEnabled = false
+                        CycleAllBtn.Text = "CYCLE STEAL ALL: OFF"
+                        CycleAllBtn.BackgroundColor3 = Color3.fromRGB(65, 20, 40)
+                        StatusLabel.Text = "Status: Target missing!"
+                        local character = player.Character
+                        local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+                        if rootPart then rootPart.Anchored = false end
+                    end
+                    task.wait(0.5)
+                else
+                    local targetFound = false
+                    for _, plot in pairs(GARDENS_FOLDER:GetChildren()) do
+                        if not cycleStealAllEnabled or stealTargetOnlyEnabled then break end
+                        local ownerName = plot:GetAttribute("Owner")
+                        if ownerName and ownerName ~= playerName then
+                            targetFound = true
+                            StatusLabel.Text = "Status: Full Plot Complete -> " .. ownerName
+                            pcall(function() runAdvancedPacedHarvestSequence(plot) end)
+                            task.wait(0.5)
+                        end
+                    end
+                    if not targetFound then
+                        StatusLabel.Text = "Status: No valid targets on map."
+                        task.wait(1)
                     end
                 end
-                if not targetFound then
-                    StatusLabel.Text = "Status: No valid targets on map."
-                    task.wait(1)
-                end
+            else
+                task.wait(0.1)
             end
-        else
-            task.wait(0.1)
         end
     end
 end)
