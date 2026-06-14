@@ -10,7 +10,7 @@ local playerGui = player:WaitForChild("PlayerGui")
 
 -- Configuration / States
 local GARDENS_FOLDER = Workspace:WaitForChild("Gardens")
-local TELEPORTS_FOLDER = Workspace:Workspace:WaitForChild("Teleports", 5) or Workspace:WaitForChild("Teleports")
+local TELEPORTS_FOLDER = Workspace:WaitForChild("Teleports", 5) or Workspace:WaitForChild("Teleports")
 local NPCS_FOLDER = Workspace:WaitForChild("NPCS")
 
 local autoCollectEnabled = false
