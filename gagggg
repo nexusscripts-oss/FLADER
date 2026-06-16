@@ -1,0 +1,1764 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local CoreGui = game:GetService("CoreGui")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- GLOBAL STATE
+local IS_ON = false
+local PREDICTION_ACTIVE = false
+local autoCollectEnabled = false
+local cycleStealAllEnabled = false
+local stealTargetOnlyEnabled = false
+local autoSellEnabled = false
+local isMinimized = false
+local tpDropdownOpen = false
+local stealDropdownOpen = false
+local waitForNightAutomation = false
+local fruitWatcherEnabled = false
+local plantDropdownOpen = false
+local settingsOpen = false
+local clickSelectActive = false
+local stealModeDropdownOpen = false
+local selectedStealMode = "Steal Best Fruits"
+
+local activeLabels = {}
+local renderConnection
+local selectedPlantsFilter = {}
+local plantFilterModes = {}
+
+local espColorRGB = Color3.fromRGB(0, 220, 140)
+local uiColorRGB = Color3.fromRGB(0, 220, 140)
+
+local plantHighlightOpen = false
+local uiColorOpen = false
+local refreshPlantMenu
+
+-- DATA TABLES
+local PLANT_BASE_WEIGHTS = {
+    ["Carrot"] = 0.80, ["Strawberry"] = 1.00, ["Blueberry"] = 1.15, ["Tulip"] = 0.50,
+    ["Tomato"] = 0.90, ["Apple"] = 1.50, ["Bamboo"] = 5.00, ["Corn"] = 3.00,
+    ["Cactus"] = 1.50, ["Pineapple"] = 5.00, ["Mushroom"] = 5.00, ["Green Bean"] = 0.50,
+    ["Banana"] = 1.50, ["Grape"] = 2.00, ["Coconut"] = 1.50, ["Mango"] = 3.00,
+    ["Dragon Fruit"] = 3.00, ["Acorn"] = 1.50, ["Cherry"] = 1.50, ["Sunflower"] = 6.00,
+    ["Venus Fly Trap"] = 3.00, ["Pomegranate"] = 1.50, ["Poison Apple"] = 2.25,
+    ["Moon Bloom"] = 9.00, ["Baby Cactus"] = 1.50, ["Horned Melon"] = 1.13,
+    ["Glow Mushroom"] = 7.00, ["Poison Ivy"] = 2.10, ["Ghost Pepper"] = 7.50
+}
+
+local PLANT_BASE_VALUES = {
+    ["Carrot"] = 5, ["Strawberry"] = 3, ["Blueberry"] = 5, ["Tulip"] = 60,
+    ["Tomato"] = 9, ["Apple"] = 12, ["Bamboo"] = 860, ["Corn"] = 34,
+    ["Cactus"] = 40, ["Pineapple"] = 30, ["Mushroom"] = 13000, ["Green Bean"] = 10,
+    ["Banana"] = 35, ["Grape"] = 45, ["Coconut"] = 60, ["Mango"] = 90,
+    ["Dragon Fruit"] = 150, ["Acorn"] = 200, ["Cherry"] = 350, ["Sunflower"] = 1800,
+    ["Venus Fly Trap"] = 3000, ["Pomegranate"] = 900, ["Poison Apple"] = 900,
+    ["Moon Bloom"] = 9000, ["Baby Cactus"] = 70, ["Horned Melon"] = 200,
+    ["Glow Mushroom"] = 700, ["Poison Ivy"] = 1700, ["Ghost Pepper"] = 2500
+}
+
+local PLANT_EXPONENTS = {
+    ["Carrot"] = 2.83,
+    ["Bamboo"] = 1.75,
+    ["Mushroom"] = 1.90
+}
+
+local MUTATION_MULTIPLIERS = {
+    ["Gold"] = 15, ["Rainbow"] = 40, ["Frozen"] = 70, ["Bloodlit"] = 60,
+    ["Starstruck"] = 45, ["Solarflare"] = 5, ["Pizza"] = 5,
+    ["Electric"] = 70
+}
+
+-- Init filter tables
+for plantName, _ in pairs(PLANT_BASE_WEIGHTS) do
+    selectedPlantsFilter[plantName] = true
+    plantFilterModes[plantName] = "Whitelist"
+end
+
+-- CALCULATION ENGINE
+local function calculateFruitPrices(seedName, fruitModel)
+    local sizeMulti = fruitModel:GetAttribute("SizeMulti") or 1
+    local baseValue = PLANT_BASE_VALUES[seedName] or 5
+    local exponent = PLANT_EXPONENTS[seedName] or 2.65
+    local priceWithoutMutation = math.floor(baseValue * math.pow(sizeMulti, exponent))
+    local mutationType = fruitModel:GetAttribute("Mutation")
+    local multiplier = 1
+    local hasMutation = false
+    if mutationType and MUTATION_MULTIPLIERS[mutationType] then
+        multiplier = MUTATION_MULTIPLIERS[mutationType]
+        hasMutation = true
+    end
+    return priceWithoutMutation * multiplier, priceWithoutMutation, hasMutation
+end
+
+-- BILLBOARD LABEL SYSTEM
+local function cloneAndFormatPrompt(originalPromptLabel, finalPrice, basePrice, hasMutation)
+    local clonedGui = originalPromptLabel:Clone()
+    clonedGui.Name = "CalculatedPriceRadarTag"
+    clonedGui.ExtentsOffset = originalPromptLabel.ExtentsOffset - Vector3.new(0, 1.2, 0)
+    local frame = clonedGui:FindFirstChild("Frame")
+    if frame then
+        local targetMutations = frame:FindFirstChild("Mutations")
+        if targetMutations then targetMutations:Destroy() end
+        local nameLabel = frame:FindFirstChild("Name")
+        if nameLabel and nameLabel:IsA("TextLabel") then
+            nameLabel.RichText = true
+            if PREDICTION_ACTIVE then
+                if hasMutation then
+                    nameLabel.Text = string.format('Around: <font color="#00BF00">%d Sheckles</font> <font color="#FFFFFF">%d Without Mutations</font>', finalPrice, basePrice)
+                else
+                    nameLabel.Text = string.format('Around: <font color="#00BF00">%d Sheckles</font>', finalPrice)
+                end
+            else
+                nameLabel.Text = "Price Prediction: OFF"
+            end
+        end
+    end
+    clonedGui.Parent = originalPromptLabel.Parent
+    return clonedGui
+end
+
+local function clearAllLabels()
+    for fruit, label in pairs(activeLabels) do
+        if label and label.Parent then label:Destroy() end
+        activeLabels[fruit] = nil
+    end
+end
+
+-- PROXIMITY PROMPT HELPER
+local function firePrompt(prompt)
+    if not prompt then return end
+    if fireproximityprompt then
+        fireproximityprompt(prompt)
+    else
+        prompt:InputBegan(Enum.UserInputType.MouseButton1)
+        task.wait(0.02)
+        prompt:InputEnded(Enum.UserInputType.MouseButton1)
+    end
+end
+
+-- GATEWAY / DISCLAIMER SCREEN
+local PromptGui = Instance.new("ScreenGui")
+PromptGui.Name = "GardenSuitePromptGui"
+PromptGui.ResetOnSpawn = false
+local ok = pcall(function() PromptGui.Parent = CoreGui end)
+if not ok then PromptGui.Parent = playerGui end
+
+local THEME_BG = Color3.fromRGB(13, 13, 17)
+local THEME_ACCENT = Color3.fromRGB(0, 220, 140)
+local THEME_SURFACE = Color3.fromRGB(22, 22, 28)
+local THEME_TEXT = Color3.fromRGB(255, 255, 255)
+local THEME_TEXT_MUTED = Color3.fromRGB(150, 152, 165)
+
+local MainPrompt = Instance.new("Frame")
+MainPrompt.Name = "MainPrompt"
+MainPrompt.Size = UDim2.new(0, 340, 0, 230)
+MainPrompt.Position = UDim2.new(0.5, -170, 0.4, -115)
+MainPrompt.BackgroundColor3 = THEME_BG
+MainPrompt.BorderSizePixel = 0
+MainPrompt.Active = true
+MainPrompt.Draggable = true
+MainPrompt.Parent = PromptGui
+Instance.new("UICorner", MainPrompt).CornerRadius = UDim.new(0, 12)
+local PromptStroke = Instance.new("UIStroke")
+PromptStroke.Color = Color3.fromRGB(35, 35, 45)
+PromptStroke.Thickness = 1
+PromptStroke.Parent = MainPrompt
+
+local TopBar = Instance.new("Frame")
+TopBar.Size = UDim2.new(1, 0, 0, 36)
+TopBar.BackgroundColor3 = THEME_SURFACE
+TopBar.BorderSizePixel = 0
+TopBar.Parent = MainPrompt
+Instance.new("UICorner", TopBar).CornerRadius = UDim.new(0, 12)
+local TBHider = Instance.new("Frame")
+TBHider.Size = UDim2.new(1, 0, 0, 10)
+TBHider.Position = UDim2.new(0, 0, 1, -10)
+TBHider.BackgroundColor3 = THEME_SURFACE
+TBHider.BorderSizePixel = 0
+TBHider.Parent = TopBar
+
+local PTitleLabel = Instance.new("TextLabel")
+PTitleLabel.Size = UDim2.new(1, -40, 1, 0)
+PTitleLabel.Position = UDim2.new(0, 16, 0, 0)
+PTitleLabel.BackgroundTransparency = 1
+PTitleLabel.Text = "SYSTEM INITIALIZATION"
+PTitleLabel.TextColor3 = THEME_ACCENT
+PTitleLabel.TextSize = 11
+PTitleLabel.Font = Enum.Font.GothamBold
+PTitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+PTitleLabel.Parent = TopBar
+
+local PXBtn = Instance.new("TextButton")
+PXBtn.Size = UDim2.new(0, 36, 0, 36)
+PXBtn.Position = UDim2.new(1, -36, 0, 0)
+PXBtn.BackgroundTransparency = 1
+PXBtn.Text = "×"
+PXBtn.TextColor3 = Color3.fromRGB(230, 80, 80)
+PXBtn.TextSize = 20
+PXBtn.Font = Enum.Font.GothamMedium
+PXBtn.Parent = TopBar
+
+-- DISCLAIMER BOX (above the confirm question)
+local DisclaimerBox = Instance.new("Frame")
+DisclaimerBox.Size = UDim2.new(1, -24, 0, 80)
+DisclaimerBox.Position = UDim2.new(0, 12, 0, 44)
+DisclaimerBox.BackgroundColor3 = Color3.fromRGB(38, 18, 18)
+DisclaimerBox.BorderSizePixel = 0
+DisclaimerBox.Parent = MainPrompt
+Instance.new("UICorner", DisclaimerBox).CornerRadius = UDim.new(0, 8)
+local DisclaimerStroke = Instance.new("UIStroke")
+DisclaimerStroke.Color = Color3.fromRGB(100, 30, 30)
+DisclaimerStroke.Thickness = 1
+DisclaimerStroke.Parent = DisclaimerBox
+
+local DisclaimerLabel = Instance.new("TextLabel")
+DisclaimerLabel.Size = UDim2.new(1, -16, 1, -8)
+DisclaimerLabel.Position = UDim2.new(0, 8, 0, 4)
+DisclaimerLabel.BackgroundTransparency = 1
+DisclaimerLabel.Text = "⚠ Disclamer! Some features might not work as expected like the Price prediction since the calculations arent 100% right but theyre near the real price. do not report any bugs or something i cant change this."
+DisclaimerLabel.TextColor3 = Color3.fromRGB(255, 120, 120)
+DisclaimerLabel.Font = Enum.Font.GothamBold
+DisclaimerLabel.TextSize = 10
+DisclaimerLabel.TextWrapped = true
+DisclaimerLabel.TextXAlignment = Enum.TextXAlignment.Left
+DisclaimerLabel.Parent = DisclaimerBox
+
+local Question = Instance.new("TextLabel")
+Question.Size = UDim2.new(1, -32, 0, 38)
+Question.Position = UDim2.new(0, 16, 0, 134)
+Question.BackgroundTransparency = 1
+Question.Text = "Would you like to dynamically load SpeedHub alongside the premium Garden v2 core suite architecture?"
+Question.TextColor3 = THEME_TEXT
+Question.TextSize = 12
+Question.Font = Enum.Font.GothamMedium
+Question.TextWrapped = true
+Question.TextXAlignment = Enum.TextXAlignment.Left
+Question.Parent = MainPrompt
+
+local YesBtn = Instance.new("TextButton")
+YesBtn.Size = UDim2.new(0.44, 0, 0, 32)
+YesBtn.Position = UDim2.new(0, 16, 1, -44)
+YesBtn.BackgroundColor3 = THEME_ACCENT
+YesBtn.BorderSizePixel = 0
+YesBtn.Text = "Load Injection"
+YesBtn.TextColor3 = Color3.fromRGB(10, 10, 15)
+YesBtn.TextSize = 12
+YesBtn.Font = Enum.Font.GothamBold
+YesBtn.Parent = MainPrompt
+Instance.new("UICorner", YesBtn).CornerRadius = UDim.new(0, 6)
+
+local NoBtn = Instance.new("TextButton")
+NoBtn.Size = UDim2.new(0.44, 0, 0, 32)
+NoBtn.Position = UDim2.new(1, -156, 1, -44)
+NoBtn.BackgroundColor3 = Color3.fromRGB(28, 28, 38)
+NoBtn.BorderSizePixel = 0
+NoBtn.Text = "Skip"
+NoBtn.TextColor3 = THEME_TEXT
+NoBtn.TextSize = 12
+NoBtn.Font = Enum.Font.GothamBold
+NoBtn.Parent = MainPrompt
+Instance.new("UICorner", NoBtn).CornerRadius = UDim.new(0, 6)
+
+-- MAIN SCRIPT BUILDER
+local function launchMainScript(shouldLoadSpeedHub)
+    PromptGui:Destroy()
+
+    if shouldLoadSpeedHub then
+        pcall(function()
+            loadstring(game:HttpGet("https://raw.githubusercontent.com/AhmadV99/Speed-Hub-X/main/Speed%20Hub%20X.lua", true))()
+        end)
+    end
+
+    local Workspace = game:GetService("Workspace")
+    local VirtualInputManager = game:GetService("VirtualInputManager")
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+    local playerName = player.Name
+    local GARDENS_FOLDER = Workspace:WaitForChild("Gardens")
+    local TELEPORTS_FOLDER = Workspace:WaitForChild("Teleports", 5) or Workspace:WaitForChild("Teleports")
+    local NPCS_FOLDER = Workspace:WaitForChild("NPCS")
+    local PLANTS_ASSETS = ReplicatedStorage:WaitForChild("Assets"):WaitForChild("Plants")
+
+    local targetStealPlot = nil
+    local fruitsHarvestedThisRun = 0
+
+    getgenv().OldPos = nil
+    getgenv().FPDH = workspace.FallenPartsDestroyHeight
+
+    local function isNightOrMoonActive()
+        return Workspace:FindFirstChild("ActiveNight")
+            or Workspace:FindFirstChild("RainbowMoon")
+            or Workspace:FindFirstChild("Bloodmoon")
+            or Workspace:FindFirstChild("ChainedMoon")
+            or Workspace:FindFirstChild("Goldmoon")
+    end
+
+    local function byPassWaitForChild(parent, path, timeout)
+        local current = parent
+        for segment in string.gmatch(path, "[^%.]+") do
+            current = current:WaitForChild(segment, timeout)
+            if not current then return nil end
+        end
+        return current
+    end
+
+    local function getMyPlot()
+        for _, plot in pairs(GARDENS_FOLDER:GetChildren()) do
+            if plot:GetAttribute("Owner") == playerName then return plot end
+        end
+        return nil
+    end
+
+    local function teleportToLocation(cframe)
+        local character = player.Character
+        if character then
+            local rootPart = character:FindFirstChild("HumanoidRootPart")
+            if rootPart then character:PivotTo(cframe) return true end
+        end
+        return false
+    end
+
+    local function executeEscapeToSizeReference()
+        local myPlot = getMyPlot()
+        if myPlot then
+            local sizeRef = myPlot:FindFirstChild("PlotSizeReference")
+            if sizeRef and sizeRef:IsA("BasePart") then
+                teleportToLocation(sizeRef.CFrame + Vector3.new(0, 5, 0))
+                return true
+            end
+        end
+        return false
+    end
+
+    local function serverHop()
+        local x = {}
+        local success, result = pcall(function()
+            return HttpService:JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Desc&limit=100"))
+        end)
+        if success and result and result.data then
+            for _, v in pairs(result.data) do
+                if v.playing and v.playing < v.maxPlayers and v.id ~= game.JobId then
+                    table.insert(x, v.id)
+                end
+            end
+        end
+        if #x > 0 then
+            TeleportService:TeleportToPlaceInstance(game.PlaceId, x[math.random(1, #x)], player)
+        end
+    end
+
+    -- MAIN SCREEN GUI
+    local ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "GG2_Universal_Suite"
+    ScreenGui.ResetOnSpawn = false
+    local ok2 = pcall(function() ScreenGui.Parent = CoreGui end)
+    if not ok2 then ScreenGui.Parent = playerGui end
+
+    -- NOTIFICATION SYSTEM
+    local NotificationContainer = Instance.new("Frame")
+    NotificationContainer.Name = "NotificationContainer"
+    NotificationContainer.Size = UDim2.new(0, 260, 0.7, 0)
+    NotificationContainer.Position = UDim2.new(1, -276, 0.3, -16)
+    NotificationContainer.BackgroundTransparency = 1
+    NotificationContainer.ZIndex = 100
+    NotificationContainer.Parent = ScreenGui
+    local NotificationLayout = Instance.new("UIListLayout", NotificationContainer)
+    NotificationLayout.Padding = UDim.new(0, 6)
+    NotificationLayout.VerticalAlignment = Enum.VerticalAlignment.Bottom
+    NotificationLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+    local function createTopRightNotify(titleText, descText, displayColor)
+        local Box = Instance.new("Frame")
+        Box.Name = "NotifyBox"
+        Box.Size = UDim2.new(1, 0, 0, 52)
+        Box.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+        Box.BorderSizePixel = 0
+        Box.BackgroundTransparency = 1
+        Instance.new("UICorner", Box).CornerRadius = UDim.new(0, 8)
+
+        local Border = Instance.new("UIStroke")
+        Border.Color = displayColor or THEME_ACCENT
+        Border.Thickness = 1
+        Border.Transparency = 1
+        Border.Parent = Box
+
+        local Tl = Instance.new("TextLabel")
+        Tl.Size = UDim2.new(1, -16, 0, 20)
+        Tl.Position = UDim2.new(0, 10, 0, 5)
+        Tl.BackgroundTransparency = 1
+        Tl.Text = titleText and tostring(titleText) or "NOTIFICATION"
+        Tl.TextColor3 = THEME_TEXT
+        Tl.TextTransparency = 1
+        Tl.TextSize = 10
+        Tl.Font = Enum.Font.GothamBold
+        Tl.TextXAlignment = Enum.TextXAlignment.Left
+        Tl.Parent = Box
+
+        local Ds = Instance.new("TextLabel")
+        Ds.Size = UDim2.new(1, -16, 0, 22)
+        Ds.Position = UDim2.new(0, 10, 0, 24)
+        Ds.BackgroundTransparency = 1
+        Ds.Text = descText and tostring(descText) or "System active."
+        Ds.TextColor3 = THEME_TEXT_MUTED
+        Ds.TextTransparency = 1
+        Ds.TextSize = 10
+        Ds.Font = Enum.Font.GothamMedium
+        Ds.TextXAlignment = Enum.TextXAlignment.Left
+        Ds.TextWrapped = true
+        Ds.Parent = Box
+
+        Box.Parent = NotificationContainer
+
+        TweenService:Create(Box, TweenInfo.new(0.25, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out), {BackgroundTransparency = 0}):Play()
+        TweenService:Create(Border, TweenInfo.new(0.25, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out), {Transparency = 0}):Play()
+        TweenService:Create(Tl, TweenInfo.new(0.25, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out), {TextTransparency = 0}):Play()
+        TweenService:Create(Ds, TweenInfo.new(0.25, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out), {TextTransparency = 0}):Play()
+
+        task.delay(5.0, function()
+            if Box and Box.Parent then
+                local fade = TweenService:Create(Box, TweenInfo.new(0.25, Enum.EasingStyle.Cubic, Enum.EasingDirection.In), {BackgroundTransparency = 1})
+                TweenService:Create(Border, TweenInfo.new(0.25, Enum.EasingStyle.Cubic, Enum.EasingDirection.In), {Transparency = 1}):Play()
+                TweenService:Create(Tl, TweenInfo.new(0.25, Enum.EasingStyle.Cubic, Enum.EasingDirection.In), {TextTransparency = 1}):Play()
+                TweenService:Create(Ds, TweenInfo.new(0.25, Enum.EasingStyle.Cubic, Enum.EasingDirection.In), {TextTransparency = 1}):Play()
+                fade:Play()
+                fade.Completed:Connect(function() Box:Destroy() end)
+            end
+        end)
+    end
+
+    -- MAIN FRAME
+    local MainFrame = Instance.new("Frame")
+    MainFrame.Name = "MainFrame"
+    MainFrame.Size = UDim2.new(0, 270, 0, 500)
+    MainFrame.Position = UDim2.new(0.05, 0, 0.25, 0)
+    MainFrame.BackgroundColor3 = THEME_BG
+    MainFrame.BorderSizePixel = 0
+    MainFrame.Active = true
+    MainFrame.Draggable = true
+    MainFrame.Parent = ScreenGui
+    Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 12)
+    local MainStroke = Instance.new("UIStroke")
+    MainStroke.Color = Color3.fromRGB(35, 35, 45)
+    MainStroke.Thickness = 1
+    MainStroke.Parent = MainFrame
+
+    local TitleBar = Instance.new("Frame")
+    TitleBar.Name = "TitleBar"
+    TitleBar.Size = UDim2.new(1, 0, 0, 42)
+    TitleBar.BackgroundColor3 = THEME_SURFACE
+    TitleBar.BorderSizePixel = 0
+    TitleBar.Parent = MainFrame
+    Instance.new("UICorner", TitleBar).CornerRadius = UDim.new(0, 12)
+    local FrameHider = Instance.new("Frame")
+    FrameHider.Size = UDim2.new(1, 0, 0, 10)
+    FrameHider.Position = UDim2.new(0, 0, 1, -10)
+    FrameHider.BackgroundColor3 = THEME_SURFACE
+    FrameHider.BorderSizePixel = 0
+    FrameHider.Parent = TitleBar
+
+    local TitleLabel = Instance.new("TextLabel")
+    TitleLabel.Size = UDim2.new(1, -95, 1, 0)
+    TitleLabel.Position = UDim2.new(0, 14, 0, 0)
+    TitleLabel.BackgroundTransparency = 1
+    TitleLabel.Text = "GARDEN SYSTEM"
+    TitleLabel.TextColor3 = THEME_TEXT
+    TitleLabel.TextSize = 13
+    TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    TitleLabel.Font = Enum.Font.GothamBold
+    TitleLabel.Parent = TitleBar
+
+    local SettingsBtn = Instance.new("TextButton")
+    SettingsBtn.Size = UDim2.new(0, 28, 0, 28)
+    SettingsBtn.Position = UDim2.new(1, -85, 0, 7)
+    SettingsBtn.BackgroundTransparency = 1
+    SettingsBtn.Text = "⚙"
+    SettingsBtn.TextColor3 = THEME_TEXT_MUTED
+    SettingsBtn.TextSize = 14
+    SettingsBtn.Font = Enum.Font.GothamBold
+    SettingsBtn.Parent = TitleBar
+
+    local MinimizeBtn = Instance.new("TextButton")
+    MinimizeBtn.Size = UDim2.new(0, 28, 0, 28)
+    MinimizeBtn.Position = UDim2.new(1, -58, 0, 7)
+    MinimizeBtn.BackgroundTransparency = 1
+    MinimizeBtn.Text = "−"
+    MinimizeBtn.TextColor3 = THEME_TEXT_MUTED
+    MinimizeBtn.TextSize = 16
+    MinimizeBtn.Font = Enum.Font.GothamBold
+    MinimizeBtn.Parent = TitleBar
+
+    local CloseBtn = Instance.new("TextButton")
+    CloseBtn.Size = UDim2.new(0, 28, 0, 28)
+    CloseBtn.Position = UDim2.new(1, -30, 0, 7)
+    CloseBtn.BackgroundTransparency = 1
+    CloseBtn.Text = "×"
+    CloseBtn.TextColor3 = Color3.fromRGB(220, 80, 80)
+    CloseBtn.TextSize = 18
+    CloseBtn.Font = Enum.Font.GothamBold
+    CloseBtn.Parent = TitleBar
+
+    local ContentFrame = Instance.new("Frame")
+    ContentFrame.Name = "ContentFrame"
+    ContentFrame.Size = UDim2.new(1, 0, 1, -42)
+    ContentFrame.Position = UDim2.new(0, 0, 0, 42)
+    ContentFrame.BackgroundTransparency = 1
+    ContentFrame.Parent = MainFrame
+
+    -- BASE HEIGHT TRACKER
+    local BASE_HEIGHT = 500
+
+    local function updateMainWindowHeight()
+        if isMinimized then return end
+        local h = BASE_HEIGHT
+        if plantDropdownOpen then h = h + 252 end
+        if settingsOpen then
+            h = h + 70
+            if plantHighlightOpen then h = h + 70 end
+            if uiColorOpen then h = h + 70 end
+        end
+        if stealModeDropdownOpen then h = h + 120 end
+        TweenService:Create(MainFrame, TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {Size = UDim2.new(0, 270, 0, h)}):Play()
+    end
+
+    -- BUTTON FACTORY
+    local function createBtn(text, yPos, colorBg)
+        local Btn = Instance.new("TextButton")
+        Btn.Size = UDim2.new(1, -24, 0, 30)
+        Btn.Position = UDim2.new(0, 12, 0, yPos)
+        Btn.BackgroundColor3 = colorBg or THEME_SURFACE
+        Btn.BorderSizePixel = 0
+        Btn.Text = text
+        Btn.TextColor3 = THEME_TEXT
+        Btn.TextSize = 11
+        Btn.Font = Enum.Font.GothamBold
+        Btn.Parent = ContentFrame
+        Instance.new("UICorner", Btn).CornerRadius = UDim.new(0, 6)
+        local bs = Instance.new("UIStroke", Btn)
+        bs.Color = Color3.fromRGB(35, 35, 45)
+        bs.Thickness = 1
+        return Btn
+    end
+
+    -- ALL BUTTONS (stacked with consistent spacing)
+    -- y positions: each button is 30px tall, 8px gap = 38px step
+    local AutoCollectBtn       = createBtn("Auto Collect: OFF",               8)
+    local FruitRadarBtn        = createBtn("Fruit Radar: OFF",                46,  Color3.fromRGB(28, 28, 36))
+    local PricePredBtn         = createBtn("Price Prediction: OFF",           84,  Color3.fromRGB(28, 28, 36))
+    local FruitWatcherBtn      = createBtn("Fruit Watcher Alert: OFF",        122)
+    local AutoSellBtn          = createBtn("Auto Sell (100/100): OFF",        160)
+
+    -- Return Home / Teleport row
+    local ReturnHomeBtn = Instance.new("TextButton")
+    ReturnHomeBtn.Size = UDim2.new(0.46, 0, 0, 30)
+    ReturnHomeBtn.Position = UDim2.new(0, 12, 0, 198)
+    ReturnHomeBtn.BackgroundColor3 = THEME_SURFACE
+    ReturnHomeBtn.BorderSizePixel = 0
+    ReturnHomeBtn.Text = "Return Home"
+    ReturnHomeBtn.TextColor3 = THEME_TEXT
+    ReturnHomeBtn.TextSize = 11
+    ReturnHomeBtn.Font = Enum.Font.GothamBold
+    ReturnHomeBtn.Parent = ContentFrame
+    Instance.new("UICorner", ReturnHomeBtn).CornerRadius = UDim.new(0, 6)
+    Instance.new("UIStroke", ReturnHomeBtn).Color = Color3.fromRGB(35, 35, 45)
+
+    local TeleportToggleBtn = Instance.new("TextButton")
+    TeleportToggleBtn.Size = UDim2.new(0.46, 0, 0, 30)
+    TeleportToggleBtn.Position = UDim2.new(1, -130, 0, 198)
+    TeleportToggleBtn.BackgroundColor3 = THEME_SURFACE
+    TeleportToggleBtn.BorderSizePixel = 0
+    TeleportToggleBtn.Text = "Teleport To... v"
+    TeleportToggleBtn.TextColor3 = THEME_TEXT
+    TeleportToggleBtn.TextSize = 11
+    TeleportToggleBtn.Font = Enum.Font.GothamBold
+    TeleportToggleBtn.Parent = ContentFrame
+    Instance.new("UICorner", TeleportToggleBtn).CornerRadius = UDim.new(0, 6)
+    Instance.new("UIStroke", TeleportToggleBtn).Color = Color3.fromRGB(35, 35, 45)
+
+    local StealToggleBtn       = createBtn("SELECT RAID TARGET... v",         236, Color3.fromRGB(30, 20, 25))
+    local StealTargetOnlyBtn   = createBtn("Auto Steal Target: OFF",          274)
+    local CycleAllBtn          = createBtn("CYCLE STEAL ALL MAP: OFF",        312)
+
+    -- Night automate dot on CycleAllBtn
+    local NightAutomateBtn = Instance.new("TextButton")
+    NightAutomateBtn.Size = UDim2.new(0, 16, 0, 16)
+    NightAutomateBtn.Position = UDim2.new(1, -24, 0.5, -8)
+    NightAutomateBtn.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+    NightAutomateBtn.Text = ""
+    NightAutomateBtn.ZIndex = 3
+    NightAutomateBtn.Parent = CycleAllBtn
+    Instance.new("UICorner", NightAutomateBtn).CornerRadius = UDim.new(0, 4)
+
+    -- STEAL MODE DROPDOWN BUTTON (under Cycle Steal)
+    local StealModeBtn = createBtn("STEAL MODE: Steal Best Fruits  v", 350, Color3.fromRGB(35, 25, 50))
+
+    local ConfigFiltersBtn     = createBtn("Configure Filtered Plants... v",  388)
+
+    local StatusLabel = Instance.new("TextLabel")
+    StatusLabel.Size = UDim2.new(1, 0, 0, 18)
+    StatusLabel.Position = UDim2.new(0, 0, 1, -20)
+    StatusLabel.BackgroundTransparency = 1
+    StatusLabel.Text = "SYSTEM ENVIRONMENT: READY"
+    StatusLabel.TextColor3 = THEME_TEXT_MUTED
+    StatusLabel.TextSize = 9
+    StatusLabel.Font = Enum.Font.GothamMedium
+    StatusLabel.Parent = ContentFrame
+
+    -- TELEPORT DROPDOWN
+    local function createScrollContainer(name, yAnchor)
+        local Menu = Instance.new("ScrollingFrame")
+        Menu.Name = name
+        Menu.Size = UDim2.new(1, -24, 0, 0)
+        Menu.Position = UDim2.new(0, 12, 0, yAnchor)
+        Menu.BackgroundColor3 = THEME_SURFACE
+        Menu.BorderSizePixel = 0
+        Menu.ScrollBarThickness = 3
+        Menu.ScrollBarImageColor3 = THEME_ACCENT
+        Menu.Visible = false
+        Menu.ZIndex = 95
+        Menu.Parent = ContentFrame
+        Instance.new("UICorner", Menu).CornerRadius = UDim.new(0, 8)
+        local sk = Instance.new("UIStroke", Menu)
+        sk.Color = Color3.fromRGB(45, 45, 55)
+        sk.Thickness = 1
+        return Menu
+    end
+
+    local TeleportMenu = createScrollContainer("TeleportMenu", 232)
+    local TeleportLayout = Instance.new("UIListLayout", TeleportMenu)
+    TeleportLayout.Padding = UDim.new(0, 3)
+
+    local StealMenu = createScrollContainer("StealMenu", 270)
+    local StealLayout = Instance.new("UIListLayout", StealMenu)
+    StealLayout.Padding = UDim.new(0, 3)
+
+    -- STEAL MODE DROPDOWN MENU (5 options, no select/deselect/click plant)
+    local StealModeMenu = Instance.new("Frame")
+    StealModeMenu.Name = "StealModeMenu"
+    StealModeMenu.Size = UDim2.new(1, -24, 0, 120)
+    StealModeMenu.Position = UDim2.new(0, 12, 0, 384)
+    StealModeMenu.BackgroundColor3 = Color3.fromRGB(28, 20, 38)
+    StealModeMenu.BorderSizePixel = 0
+    StealModeMenu.Visible = false
+    StealModeMenu.ZIndex = 95
+    StealModeMenu.Parent = ContentFrame
+    Instance.new("UICorner", StealModeMenu).CornerRadius = UDim.new(0, 8)
+    local smsk = Instance.new("UIStroke", StealModeMenu)
+    smsk.Color = Color3.fromRGB(60, 40, 80)
+    smsk.Thickness = 1
+    local SMLLayout = Instance.new("UIListLayout", StealModeMenu)
+    SMLLayout.Padding = UDim.new(0, 2)
+    SMLLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+
+    local STEAL_MODES = {
+        "Steal Best Fruits",
+        "Steal Normal Fruits",
+        "Steal Only Mutated",
+        "Steal Heaviest",
+        "Random Steal"
+    }
+
+    for _, optName in ipairs(STEAL_MODES) do
+        local OMB = Instance.new("TextButton")
+        OMB.Size = UDim2.new(1, -12, 0, 22)
+        OMB.BackgroundColor3 = Color3.fromRGB(40, 28, 55)
+        OMB.BorderSizePixel = 0
+        OMB.Text = optName
+        OMB.TextColor3 = THEME_TEXT
+        OMB.TextSize = 11
+        OMB.Font = Enum.Font.GothamBold
+        OMB.ZIndex = 96
+        OMB.Parent = StealModeMenu
+        Instance.new("UICorner", OMB).CornerRadius = UDim.new(0, 5)
+
+        OMB.MouseButton1Click:Connect(function()
+            selectedStealMode = optName
+            StealModeBtn.Text = "STEAL MODE: " .. optName .. "  v"
+            stealModeDropdownOpen = false
+            StealModeMenu.Visible = false
+            updateMainWindowHeight()
+            createTopRightNotify("STEAL MODE SET", optName, THEME_ACCENT)
+        end)
+    end
+
+    -- CONFIGURE FILTERED PLANTS MENU
+    local PlantMenuContainer = Instance.new("Frame")
+    PlantMenuContainer.Name = "PlantMenuContainer"
+    PlantMenuContainer.Size = UDim2.new(1, -24, 0, 252)
+    PlantMenuContainer.Position = UDim2.new(0, 12, 0, 422)
+    PlantMenuContainer.BackgroundColor3 = THEME_SURFACE
+    PlantMenuContainer.BorderSizePixel = 0
+    PlantMenuContainer.Visible = false
+    PlantMenuContainer.ZIndex = 60
+    PlantMenuContainer.Parent = ContentFrame
+    Instance.new("UICorner", PlantMenuContainer).CornerRadius = UDim.new(0, 8)
+    local pks = Instance.new("UIStroke", PlantMenuContainer)
+    pks.Color = Color3.fromRGB(45, 45, 55)
+
+    -- Click Select inside plant menu
+    local ClickSelectBtn = Instance.new("TextButton")
+    ClickSelectBtn.Size = UDim2.new(1, -16, 0, 28)
+    ClickSelectBtn.Position = UDim2.new(0, 8, 0, 8)
+    ClickSelectBtn.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+    ClickSelectBtn.BorderSizePixel = 0
+    ClickSelectBtn.Text = "Click Select Tool: INACTIVE"
+    ClickSelectBtn.TextColor3 = THEME_TEXT
+    ClickSelectBtn.TextSize = 10
+    ClickSelectBtn.Font = Enum.Font.GothamBold
+    ClickSelectBtn.ZIndex = 62
+    ClickSelectBtn.Parent = PlantMenuContainer
+    Instance.new("UICorner", ClickSelectBtn).CornerRadius = UDim.new(0, 6)
+    local css = Instance.new("UIStroke", ClickSelectBtn)
+    css.Color = Color3.fromRGB(45, 45, 55)
+
+    -- Select / Deselect All header
+    local PlantMenuHeader = Instance.new("Frame")
+    PlantMenuHeader.Size = UDim2.new(1, 0, 0, 26)
+    PlantMenuHeader.Position = UDim2.new(0, 0, 0, 42)
+    PlantMenuHeader.BackgroundTransparency = 1
+    PlantMenuHeader.ZIndex = 61
+    PlantMenuHeader.Parent = PlantMenuContainer
+
+    local SelectAllBtn = Instance.new("TextButton")
+    SelectAllBtn.Size = UDim2.new(0.46, -4, 1, 0)
+    SelectAllBtn.Position = UDim2.new(0, 8, 0, 0)
+    SelectAllBtn.BackgroundColor3 = Color3.fromRGB(30, 35, 40)
+    SelectAllBtn.BorderSizePixel = 0
+    SelectAllBtn.Text = "Select All"
+    SelectAllBtn.TextColor3 = THEME_TEXT
+    SelectAllBtn.TextSize = 10
+    SelectAllBtn.Font = Enum.Font.GothamBold
+    SelectAllBtn.ZIndex = 62
+    SelectAllBtn.Parent = PlantMenuHeader
+    Instance.new("UICorner", SelectAllBtn).CornerRadius = UDim.new(0, 4)
+
+    local DeselectAllBtn = Instance.new("TextButton")
+    DeselectAllBtn.Size = UDim2.new(0.46, -4, 1, 0)
+    DeselectAllBtn.Position = UDim2.new(0.54, 4, 0, 0)
+    DeselectAllBtn.BackgroundColor3 = Color3.fromRGB(35, 30, 30)
+    DeselectAllBtn.BorderSizePixel = 0
+    DeselectAllBtn.Text = "Deselect All"
+    DeselectAllBtn.TextColor3 = THEME_TEXT
+    DeselectAllBtn.TextSize = 10
+    DeselectAllBtn.Font = Enum.Font.GothamBold
+    DeselectAllBtn.ZIndex = 62
+    DeselectAllBtn.Parent = PlantMenuHeader
+    Instance.new("UICorner", DeselectAllBtn).CornerRadius = UDim.new(0, 4)
+
+    -- Plant scroll list (with whitelist/blacklist + click plant per row)
+    local PlantMenu = Instance.new("ScrollingFrame")
+    PlantMenu.Size = UDim2.new(1, -16, 0, 162)
+    PlantMenu.Position = UDim2.new(0, 8, 0, 74)
+    PlantMenu.BackgroundTransparency = 1
+    PlantMenu.BorderSizePixel = 0
+    PlantMenu.ScrollBarThickness = 3
+    PlantMenu.ScrollBarImageColor3 = THEME_ACCENT
+    PlantMenu.ZIndex = 61
+    PlantMenu.Parent = PlantMenuContainer
+    local PlantLayout = Instance.new("UIListLayout", PlantMenu)
+    PlantLayout.Padding = UDim.new(0, 2)
+
+    function refreshPlantMenu()
+        for _, child in pairs(PlantMenu:GetChildren()) do
+            if child:IsA("Frame") then child:Destroy() end
+        end
+
+        local plantList = {}
+        for pName, _ in pairs(PLANT_BASE_WEIGHTS) do table.insert(plantList, pName) end
+        table.sort(plantList)
+
+        for _, plantName in ipairs(plantList) do
+            local Row = Instance.new("Frame")
+            Row.Size = UDim2.new(1, -4, 0, 26)
+            Row.BackgroundColor3 = Color3.fromRGB(26, 26, 34)
+            Row.BorderSizePixel = 0
+            Row.ZIndex = 62
+            Row.Parent = PlantMenu
+            Instance.new("UICorner", Row).CornerRadius = UDim.new(0, 4)
+
+            -- Name / toggle
+            local NameBtn = Instance.new("TextButton")
+            NameBtn.Size = UDim2.new(0.42, 0, 1, 0)
+            NameBtn.BackgroundTransparency = 1
+            NameBtn.Text = " " .. plantName
+            NameBtn.TextColor3 = selectedPlantsFilter[plantName] and THEME_ACCENT or THEME_TEXT_MUTED
+            NameBtn.Font = Enum.Font.GothamBold
+            NameBtn.TextSize = 10
+            NameBtn.TextXAlignment = Enum.TextXAlignment.Left
+            NameBtn.ZIndex = 63
+            NameBtn.Parent = Row
+
+            -- Whitelist / Blacklist toggle
+            local ModeBtn = Instance.new("TextButton")
+            ModeBtn.Size = UDim2.new(0.30, 0, 1, -6)
+            ModeBtn.Position = UDim2.new(0.43, 0, 0, 3)
+            ModeBtn.BackgroundColor3 = (plantFilterModes[plantName] == "Whitelist") and Color3.fromRGB(20, 70, 35) or Color3.fromRGB(80, 25, 25)
+            ModeBtn.BorderSizePixel = 0
+            ModeBtn.Text = plantFilterModes[plantName]
+            ModeBtn.TextColor3 = THEME_TEXT
+            ModeBtn.Font = Enum.Font.GothamBold
+            ModeBtn.TextSize = 9
+            ModeBtn.ZIndex = 63
+            ModeBtn.Parent = Row
+            Instance.new("UICorner", ModeBtn).CornerRadius = UDim.new(0, 4)
+
+            -- Click Plant button
+            local ClickBtn = Instance.new("TextButton")
+            ClickBtn.Size = UDim2.new(0.24, 0, 1, -6)
+            ClickBtn.Position = UDim2.new(0.75, 0, 0, 3)
+            ClickBtn.BackgroundColor3 = Color3.fromRGB(28, 38, 55)
+            ClickBtn.BorderSizePixel = 0
+            ClickBtn.Text = "Click Plant"
+            ClickBtn.TextColor3 = Color3.fromRGB(100, 180, 255)
+            ClickBtn.Font = Enum.Font.GothamBold
+            ClickBtn.TextSize = 9
+            ClickBtn.ZIndex = 63
+            ClickBtn.Parent = Row
+            Instance.new("UICorner", ClickBtn).CornerRadius = UDim.new(0, 4)
+
+            -- Events
+            NameBtn.MouseButton1Click:Connect(function()
+                selectedPlantsFilter[plantName] = not selectedPlantsFilter[plantName]
+                NameBtn.TextColor3 = selectedPlantsFilter[plantName] and THEME_ACCENT or THEME_TEXT_MUTED
+            end)
+
+            ModeBtn.MouseButton1Click:Connect(function()
+                plantFilterModes[plantName] = (plantFilterModes[plantName] == "Whitelist") and "Blacklist" or "Whitelist"
+                ModeBtn.Text = plantFilterModes[plantName]
+                ModeBtn.BackgroundColor3 = (plantFilterModes[plantName] == "Whitelist") and Color3.fromRGB(20, 70, 35) or Color3.fromRGB(80, 25, 25)
+            end)
+
+            ClickBtn.MouseButton1Click:Connect(function()
+                clickSelectActive = true
+                ClickSelectBtn.Text = "CLICK ANY PART IN GAME WORLD..."
+                ClickSelectBtn.BackgroundColor3 = Color3.fromRGB(30, 45, 40)
+                css.Color = THEME_ACCENT
+                createTopRightNotify("CLICK SELECT", "Click a plant in the world to select: " .. plantName, THEME_ACCENT)
+                -- Override: once user clicks, resolve to this specific plant
+                local conn
+                conn = UserInputService.InputBegan:Connect(function(input, processed)
+                    if not processed and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+                        conn:Disconnect()
+                        clickSelectActive = false
+                        selectedPlantsFilter[plantName] = true
+                        NameBtn.TextColor3 = THEME_ACCENT
+                        ClickSelectBtn.Text = "Click Select Tool: INACTIVE"
+                        ClickSelectBtn.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+                        css.Color = Color3.fromRGB(45, 45, 55)
+                        createTopRightNotify("PLANT SELECTED", plantName .. " added to filter.", THEME_ACCENT)
+                    end
+                end)
+            end)
+        end
+        PlantMenu.CanvasSize = UDim2.new(0, 0, 0, PlantLayout.AbsoluteContentSize.Y)
+    end
+
+    -- SETTINGS PANEL
+    local SettingsPanel = Instance.new("Frame")
+    SettingsPanel.Name = "SettingsPanel"
+    SettingsPanel.Size = UDim2.new(1, -24, 0, 60)
+    SettingsPanel.Position = UDim2.new(0, 12, 1, -32)
+    SettingsPanel.BackgroundColor3 = THEME_SURFACE
+    SettingsPanel.Visible = false
+    SettingsPanel.ZIndex = 70
+    SettingsPanel.Parent = ContentFrame
+    Instance.new("UICorner", SettingsPanel).CornerRadius = UDim.new(0, 8)
+    local ssk = Instance.new("UIStroke", SettingsPanel)
+    ssk.Color = Color3.fromRGB(45, 45, 55)
+
+    local function createInlineColorSection(labelText, yAnchor, defaultColor, isUiMode)
+        local ContainerFrame = Instance.new("Frame")
+        ContainerFrame.Size = UDim2.new(1, -16, 0, 22)
+        ContainerFrame.Position = UDim2.new(0, 8, 0, yAnchor)
+        ContainerFrame.BackgroundTransparency = 1
+        ContainerFrame.ZIndex = 71
+        ContainerFrame.Parent = SettingsPanel
+
+        local TextBtn = Instance.new("TextButton")
+        TextBtn.Size = UDim2.new(0.75, 0, 1, 0)
+        TextBtn.BackgroundTransparency = 1
+        TextBtn.Text = labelText .. " <"
+        TextBtn.TextColor3 = THEME_TEXT
+        TextBtn.TextSize = 10
+        TextBtn.Font = Enum.Font.GothamBold
+        TextBtn.TextXAlignment = Enum.TextXAlignment.Left
+        TextBtn.ZIndex = 72
+        TextBtn.Parent = ContainerFrame
+
+        local DisplaySquare = Instance.new("Frame")
+        DisplaySquare.Size = UDim2.new(0, 14, 0, 14)
+        DisplaySquare.Position = UDim2.new(1, -20, 0.5, -7)
+        DisplaySquare.BackgroundColor3 = defaultColor
+        DisplaySquare.BorderSizePixel = 0
+        DisplaySquare.ZIndex = 72
+        DisplaySquare.Parent = ContainerFrame
+        Instance.new("UICorner", DisplaySquare).CornerRadius = UDim.new(0, 3)
+
+        local SliderBox = Instance.new("Frame")
+        SliderBox.Size = UDim2.new(1, 0, 0, 65)
+        SliderBox.Position = UDim2.new(0, 0, 0, 24)
+        SliderBox.BackgroundColor3 = Color3.fromRGB(16, 16, 22)
+        SliderBox.Visible = false
+        SliderBox.ZIndex = 72
+        SliderBox.Parent = ContainerFrame
+        Instance.new("UICorner", SliderBox).CornerRadius = UDim.new(0, 5)
+        local bsk = Instance.new("UIStroke", SliderBox)
+        bsk.Color = Color3.fromRGB(35, 35, 45)
+
+        local function buildSlider(channel, offset, startVal)
+            local SFrame = Instance.new("Frame")
+            SFrame.Size = UDim2.new(1, -12, 0, 16)
+            SFrame.Position = UDim2.new(0, 6, 0, offset)
+            SFrame.BackgroundTransparency = 1
+            SFrame.ZIndex = 73
+            SFrame.Parent = SliderBox
+
+            local Lbl = Instance.new("TextLabel")
+            Lbl.Size = UDim2.new(0, 12, 1, 0)
+            Lbl.BackgroundTransparency = 1
+            Lbl.Text = channel
+            Lbl.TextColor3 = THEME_TEXT_MUTED
+            Lbl.TextSize = 9
+            Lbl.Font = Enum.Font.GothamBold
+            Lbl.ZIndex = 74
+            Lbl.Parent = SFrame
+
+            local Bar = Instance.new("Frame")
+            Bar.Size = UDim2.new(1, -40, 0, 3)
+            Bar.Position = UDim2.new(0, 16, 0.5, -1)
+            Bar.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+            Bar.ZIndex = 74
+            Bar.Parent = SFrame
+
+            local Pin = Instance.new("Frame")
+            Pin.Size = UDim2.new(0, 8, 0, 8)
+            Pin.Position = UDim2.new(startVal / 255, -4, 0.5, -4)
+            Pin.BackgroundColor3 = THEME_ACCENT
+            Pin.ZIndex = 75
+            Pin.Parent = Bar
+            Instance.new("UICorner", Pin).CornerRadius = UDim.new(1, 0)
+
+            local VLabel = Instance.new("TextLabel")
+            VLabel.Size = UDim2.new(0, 20, 1, 0)
+            VLabel.Position = UDim2.new(1, -20, 0, 0)
+            VLabel.BackgroundTransparency = 1
+            VLabel.Text = tostring(startVal)
+            VLabel.TextColor3 = THEME_TEXT
+            VLabel.TextSize = 9
+            VLabel.Font = Enum.Font.GothamMedium
+            VLabel.ZIndex = 74
+            VLabel.Parent = SFrame
+
+            local dragging = false
+            Pin.InputBegan:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = true end
+            end)
+            UserInputService.InputEnded:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = false end
+            end)
+            UserInputService.InputChanged:Connect(function(input)
+                if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+                    local relX = math.clamp((input.Position.X - Bar.AbsolutePosition.X) / Bar.AbsoluteSize.X, 0, 1)
+                    Pin.Position = UDim2.new(relX, -4, 0.5, -4)
+                    local finalV = math.round(relX * 255)
+                    VLabel.Text = tostring(finalV)
+                    local r = tonumber(channel == "R" and finalV or (SliderBox:FindFirstChild("R") and SliderBox.R.ValLbl.Text)) or 0
+                    local g = tonumber(channel == "G" and finalV or (SliderBox:FindFirstChild("G") and SliderBox.G.ValLbl.Text)) or 0
+                    local b = tonumber(channel == "B" and finalV or (SliderBox:FindFirstChild("B") and SliderBox.B.ValLbl.Text)) or 0
+                    local combinedColor = Color3.fromRGB(r, g, b)
+                    DisplaySquare.BackgroundColor3 = combinedColor
+                    if isUiMode then
+                        uiColorRGB = combinedColor
+                        TitleLabel.TextColor3 = combinedColor
+                    else
+                        espColorRGB = combinedColor
+                    end
+                end
+            end)
+            SFrame.Name = channel
+            Bar.Name = "Bar"
+            VLabel.Name = "ValLbl"
+        end
+
+        buildSlider("R", 6, defaultColor.R * 255)
+        buildSlider("G", 24, defaultColor.G * 255)
+        buildSlider("B", 42, defaultColor.B * 255)
+
+        TextBtn.MouseButton1Click:Connect(function()
+            local isOpen
+            if isUiMode then
+                uiColorOpen = not uiColorOpen
+                isOpen = uiColorOpen
+            else
+                plantHighlightOpen = not plantHighlightOpen
+                isOpen = plantHighlightOpen
+            end
+            TextBtn.Text = labelText .. (isOpen and " >" or " <")
+            SliderBox.Visible = isOpen
+            ContainerFrame.Size = UDim2.new(1, -16, 0, isOpen and 92 or 22)
+            if not isUiMode then
+                local uiSection = SettingsPanel:FindFirstChild("UiColorSection")
+                if uiSection then
+                    uiSection.Position = UDim2.new(0, 8, 0, isOpen and 100 or 32)
+                end
+            end
+            local finalPanelHeight = 60
+            if plantHighlightOpen then finalPanelHeight = finalPanelHeight + 70 end
+            if uiColorOpen then finalPanelHeight = finalPanelHeight + 70 end
+            SettingsPanel.Size = UDim2.new(1, -24, 0, finalPanelHeight)
+            updateMainWindowHeight()
+        end)
+        ContainerFrame.Name = isUiMode and "UiColorSection" or "PlantColorSection"
+    end
+
+    createInlineColorSection("PLANT HIGHLIGHT COLOR", 6, espColorRGB, false)
+    createInlineColorSection("UI COLOR THING", 32, uiColorRGB, true)
+
+    -- HELPERS
+    local function showTopWarningNotification()
+        createTopRightNotify("OPERATION BLOCKED", "The atmospheric star cycles are invalid. Wait for Nightfall/Moon phase cycles.", Color3.fromRGB(230, 80, 80))
+    end
+
+    local function getNearestPlot()
+        local character = player.Character
+        local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+        if not rootPart then return nil end
+        local closestPlot, shortestDistance = nil, math.huge
+        for _, plot in pairs(GARDENS_FOLDER:GetChildren()) do
+            local spawnPoint = plot:FindFirstChild("SpawnPoint")
+            if spawnPoint and spawnPoint:IsA("BasePart") then
+                local dist = (rootPart.Position - spawnPoint.Position).Magnitude
+                if dist < shortestDistance then shortestDistance = dist closestPlot = plot end
+            end
+        end
+        return closestPlot
+    end
+
+    local function clickImageButton(button)
+        if getconnections then
+            for _, eventName in pairs({"MouseButton1Click", "Activated"}) do
+                for _, conn in pairs(getconnections(button[eventName])) do conn:Fire() end
+            end
+        end
+        pcall(function()
+            local x = button.AbsolutePosition.X + (button.AbsoluteSize.X / 2)
+            local y = button.AbsolutePosition.Y + (button.AbsoluteSize.Y / 2) + 58
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
+            task.wait(0.05)
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
+        end)
+    end
+
+    -- MENU REFRESH FUNCTIONS
+    local function refreshTeleportMenu()
+        for _, child in pairs(TeleportMenu:GetChildren()) do if child:IsA("TextButton") then child:Destroy() end end
+        local plots = GARDENS_FOLDER:GetChildren()
+        table.sort(plots, function(a, b) return a.Name < b.Name end)
+        for _, plot in pairs(plots) do
+            local ownerName = plot:GetAttribute("Owner")
+            local displayName = ownerName and (ownerName .. "'s Garden") or (plot.Name .. " (Empty)")
+            local OptionBtn = Instance.new("TextButton")
+            OptionBtn.Size = UDim2.new(1, -6, 0, 24)
+            OptionBtn.BackgroundColor3 = Color3.fromRGB(26, 26, 34)
+            OptionBtn.BorderSizePixel = 0
+            OptionBtn.Text = "   " .. displayName
+            OptionBtn.TextColor3 = THEME_TEXT
+            OptionBtn.TextSize = 10
+            OptionBtn.Font = Enum.Font.GothamMedium
+            OptionBtn.TextXAlignment = Enum.TextXAlignment.Left
+            OptionBtn.ZIndex = 96
+            OptionBtn.Parent = TeleportMenu
+            Instance.new("UICorner", OptionBtn).CornerRadius = UDim.new(0, 4)
+            OptionBtn.MouseButton1Click:Connect(function()
+                local sp = plot:FindFirstChild("SpawnPoint")
+                if sp then teleportToLocation(sp.CFrame + Vector3.new(0, 3, 0)) end
+                tpDropdownOpen = false TeleportMenu.Visible = false TeleportToggleBtn.Text = "Teleport To... v"
+            end)
+        end
+        TeleportMenu.CanvasSize = UDim2.new(0, 0, 0, TeleportLayout.AbsoluteContentSize.Y)
+    end
+
+    local function refreshStealMenu()
+        for _, child in pairs(StealMenu:GetChildren()) do if child:IsA("TextButton") then child:Destroy() end end
+        local plots = GARDENS_FOLDER:GetChildren()
+        table.sort(plots, function(a, b) return a.Name < b.Name end)
+        for _, plot in pairs(plots) do
+            local ownerName = plot:GetAttribute("Owner")
+            if ownerName and ownerName ~= playerName then
+                local OptionBtn = Instance.new("TextButton")
+                OptionBtn.Size = UDim2.new(1, -6, 0, 24)
+                OptionBtn.BackgroundColor3 = Color3.fromRGB(36, 24, 28)
+                OptionBtn.BorderSizePixel = 0
+                OptionBtn.Text = "   [TARGET] " .. ownerName
+                OptionBtn.TextColor3 = THEME_TEXT
+                OptionBtn.TextSize = 10
+                OptionBtn.Font = Enum.Font.GothamMedium
+                OptionBtn.TextXAlignment = Enum.TextXAlignment.Left
+                OptionBtn.ZIndex = 96
+                OptionBtn.Parent = StealMenu
+                Instance.new("UICorner", OptionBtn).CornerRadius = UDim.new(0, 4)
+                OptionBtn.MouseButton1Click:Connect(function()
+                    targetStealPlot = plot
+                    StealToggleBtn.Text = "LOCK: " .. ownerName:upper()
+                    stealDropdownOpen = false StealMenu.Visible = false
+                end)
+            end
+        end
+        StealMenu.CanvasSize = UDim2.new(0, 0, 0, StealLayout.AbsoluteContentSize.Y)
+    end
+
+    -- ESP SYSTEM
+    local function applySmoothFadingESP(model)
+        local highlight = Instance.new("Highlight")
+        highlight.FillColor = espColorRGB
+        highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+        highlight.FillTransparency = 0.25
+        highlight.Adornee = model
+        highlight.Parent = model
+        task.spawn(function()
+            task.wait(4)
+            for i = 1, 15 do
+                if highlight and highlight.Parent then
+                    highlight.FillTransparency = 0.25 + (0.75 * (i / 15))
+                    highlight.OutlineTransparency = i / 15
+                    task.wait(0.04)
+                end
+            end
+            if highlight then highlight:Destroy() end
+        end)
+    end
+
+    -- FRUIT RADAR RENDER LOOP
+    renderConnection = RunService.RenderStepped:Connect(function()
+        if not IS_ON then
+            clearAllLabels()
+            return
+        end
+        local gardens = workspace:FindFirstChild("Gardens")
+        if not gardens then return end
+        local validFruits = {}
+
+        for _, plot in pairs(gardens:GetChildren()) do
+            local plantsFolder = plot:FindFirstChild("Plants")
+            if plantsFolder then
+                for _, plantModel in ipairs(plantsFolder:GetChildren()) do
+                    if plantModel:IsA("Model") then
+                        local seedName = plantModel:GetAttribute("SeedName")
+                        local fruitsFolder = plantModel:FindFirstChild("Fruits")
+                        if seedName and fruitsFolder then
+                            for _, fruitModel in ipairs(fruitsFolder:GetChildren()) do
+                                if fruitModel:IsA("Model") then
+                                    local harvestPart = fruitModel:FindFirstChild("HarvestPart")
+                                    local originalPrompt = harvestPart and harvestPart:FindFirstChild("HarvestPromptLabel")
+                                    if originalPrompt and originalPrompt:IsA("BillboardGui") then
+                                        validFruits[fruitModel] = true
+                                        local label = activeLabels[fruitModel]
+                                        if not label or label.Parent == nil then
+                                            local finalPrice, basePrice, hasMutation = calculateFruitPrices(seedName, fruitModel)
+                                            label = cloneAndFormatPrompt(originalPrompt, finalPrice, basePrice, hasMutation)
+                                            activeLabels[fruitModel] = label
+                                        else
+                                            -- Update label if SizeMulti changed
+                                            local frame = label:FindFirstChild("Frame")
+                                            if frame and PREDICTION_ACTIVE then
+                                                local nameLabel = frame:FindFirstChild("Name")
+                                                if nameLabel and nameLabel:IsA("TextLabel") then
+                                                    local finalPrice2, basePrice2, hasMutation2 = calculateFruitPrices(seedName, fruitModel)
+                                                    nameLabel.RichText = true
+                                                    if hasMutation2 then
+                                                        nameLabel.Text = string.format('Around: <font color="#00BF00">%d Sheckles</font> <font color="#FFFFFF">%d Without Mutations</font>', finalPrice2, basePrice2)
+                                                    else
+                                                        nameLabel.Text = string.format('Around: <font color="#00BF00">%d Sheckles</font>', finalPrice2)
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        for fruitModel, label in pairs(activeLabels) do
+            if not validFruits[fruitModel] or not fruitModel.Parent then
+                if label and label.Parent then label:Destroy() end
+                activeLabels[fruitModel] = nil
+            end
+        end
+    end)
+
+    -- BUTTON CLICK EVENTS
+    FruitRadarBtn.MouseButton1Click:Connect(function()
+        IS_ON = not IS_ON
+        if IS_ON then
+            FruitRadarBtn.Text = "Fruit Radar: ON"
+            FruitRadarBtn.BackgroundColor3 = Color3.fromRGB(0, 140, 80)
+            createTopRightNotify("FRUIT RADAR", "Scanning all gardens for price tags.", THEME_ACCENT)
+        else
+            FruitRadarBtn.Text = "Fruit Radar: OFF"
+            FruitRadarBtn.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+            clearAllLabels()
+        end
+    end)
+
+    PricePredBtn.MouseButton1Click:Connect(function()
+        PREDICTION_ACTIVE = not PREDICTION_ACTIVE
+        if PREDICTION_ACTIVE then
+            PricePredBtn.Text = "Price Prediction: ON"
+            PricePredBtn.BackgroundColor3 = Color3.fromRGB(0, 140, 80)
+            createTopRightNotify("PRICE PREDICTION", "Estimated Sheckle values shown on fruits.", THEME_ACCENT)
+        else
+            PricePredBtn.Text = "Price Prediction: OFF"
+            PricePredBtn.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+        end
+        clearAllLabels()
+    end)
+
+    AutoCollectBtn.MouseButton1Click:Connect(function()
+        autoCollectEnabled = not autoCollectEnabled
+        if autoCollectEnabled then
+            cycleStealAllEnabled = false
+            CycleAllBtn.Text = "CYCLE STEAL ALL MAP: OFF"
+            AutoCollectBtn.Text = "Auto Collect: ACTIVE"
+            AutoCollectBtn.BackgroundColor3 = THEME_ACCENT
+            AutoCollectBtn.TextColor3 = Color3.fromRGB(10, 10, 15)
+        else
+            AutoCollectBtn.Text = "Auto Collect: OFF"
+            AutoCollectBtn.BackgroundColor3 = THEME_SURFACE
+            AutoCollectBtn.TextColor3 = THEME_TEXT
+        end
+    end)
+
+    FruitWatcherBtn.MouseButton1Click:Connect(function()
+        fruitWatcherEnabled = not fruitWatcherEnabled
+        if fruitWatcherEnabled then
+            FruitWatcherBtn.Text = "Fruit Watcher Alert: ACTIVE"
+            FruitWatcherBtn.BackgroundColor3 = THEME_ACCENT
+            FruitWatcherBtn.TextColor3 = Color3.fromRGB(10, 10, 15)
+            createTopRightNotify("WATCHER ENGAGED", "Live scanning garden array assets.", espColorRGB)
+        else
+            FruitWatcherBtn.Text = "Fruit Watcher Alert: OFF"
+            FruitWatcherBtn.BackgroundColor3 = THEME_SURFACE
+            FruitWatcherBtn.TextColor3 = THEME_TEXT
+        end
+    end)
+
+    AutoSellBtn.MouseButton1Click:Connect(function()
+        autoSellEnabled = not autoSellEnabled
+        AutoSellBtn.Text = autoSellEnabled and "Auto Sell (100/100): ACTIVE" or "Auto Sell (100/100): OFF"
+    end)
+
+    ReturnHomeBtn.MouseButton1Click:Connect(function()
+        local character = player.Character
+        if character and character:FindFirstChild("HumanoidRootPart") then character.HumanoidRootPart.Anchored = false end
+        executeEscapeToSizeReference()
+    end)
+
+    TeleportToggleBtn.MouseButton1Click:Connect(function()
+        tpDropdownOpen = not tpDropdownOpen
+        stealDropdownOpen = false StealMenu.Visible = false
+        stealModeDropdownOpen = false StealModeMenu.Visible = false
+        plantDropdownOpen = false PlantMenuContainer.Visible = false ConfigFiltersBtn.Text = "Configure Filtered Plants... v"
+        settingsOpen = false SettingsPanel.Visible = false
+        if tpDropdownOpen then
+            refreshTeleportMenu()
+            TeleportMenu.Visible = true
+            TweenService:Create(TeleportMenu, TweenInfo.new(0.2), {Size = UDim2.new(1, -24, 0, 110)}):Play()
+        else
+            TeleportMenu.Visible = false TeleportMenu.Size = UDim2.new(1, -24, 0, 0)
+        end
+        updateMainWindowHeight()
+    end)
+
+    StealToggleBtn.MouseButton1Click:Connect(function()
+        stealDropdownOpen = not stealDropdownOpen
+        tpDropdownOpen = false TeleportMenu.Visible = false
+        stealModeDropdownOpen = false StealModeMenu.Visible = false
+        plantDropdownOpen = false PlantMenuContainer.Visible = false ConfigFiltersBtn.Text = "Configure Filtered Plants... v"
+        settingsOpen = false SettingsPanel.Visible = false
+        if stealDropdownOpen then
+            refreshStealMenu()
+            StealMenu.Visible = true
+            TweenService:Create(StealMenu, TweenInfo.new(0.2), {Size = UDim2.new(1, -24, 0, 110)}):Play()
+        else
+            StealMenu.Visible = false StealMenu.Size = UDim2.new(1, -24, 0, 0)
+        end
+        updateMainWindowHeight()
+    end)
+
+    StealTargetOnlyBtn.MouseButton1Click:Connect(function()
+        if not targetStealPlot and not stealTargetOnlyEnabled then return end
+        if not stealTargetOnlyEnabled and not isNightOrMoonActive() and not waitForNightAutomation then
+            showTopWarningNotification() return
+        end
+        stealTargetOnlyEnabled = not stealTargetOnlyEnabled
+        StealTargetOnlyBtn.Text = stealTargetOnlyEnabled and "Auto Steal Target: ACTIVE" or "Auto Steal Target: OFF"
+        StealTargetOnlyBtn.BackgroundColor3 = stealTargetOnlyEnabled and Color3.fromRGB(130, 60, 220) or THEME_SURFACE
+    end)
+
+    -- STEAL MODE DROPDOWN TOGGLE
+    StealModeBtn.MouseButton1Click:Connect(function()
+        stealModeDropdownOpen = not stealModeDropdownOpen
+        tpDropdownOpen = false TeleportMenu.Visible = false
+        stealDropdownOpen = false StealMenu.Visible = false
+        plantDropdownOpen = false PlantMenuContainer.Visible = false ConfigFiltersBtn.Text = "Configure Filtered Plants... v"
+        settingsOpen = false SettingsPanel.Visible = false
+        StealModeMenu.Visible = stealModeDropdownOpen
+        updateMainWindowHeight()
+    end)
+
+    -- CONFIGURE FILTERED PLANTS TOGGLE
+    ConfigFiltersBtn.MouseButton1Click:Connect(function()
+        plantDropdownOpen = not plantDropdownOpen
+        tpDropdownOpen = false TeleportMenu.Visible = false
+        stealDropdownOpen = false StealMenu.Visible = false
+        stealModeDropdownOpen = false StealModeMenu.Visible = false
+        settingsOpen = false SettingsPanel.Visible = false
+        if plantDropdownOpen then
+            refreshPlantMenu()
+            PlantMenuContainer.Visible = true
+            ConfigFiltersBtn.Text = "Close Plant Filter Menu ^"
+        else
+            PlantMenuContainer.Visible = false
+            ConfigFiltersBtn.Text = "Configure Filtered Plants... v"
+        end
+        updateMainWindowHeight()
+    end)
+
+    SelectAllBtn.MouseButton1Click:Connect(function()
+        for pName, _ in pairs(PLANT_BASE_WEIGHTS) do selectedPlantsFilter[pName] = true end
+        refreshPlantMenu()
+    end)
+
+    DeselectAllBtn.MouseButton1Click:Connect(function()
+        for pName, _ in pairs(PLANT_BASE_WEIGHTS) do selectedPlantsFilter[pName] = false end
+        refreshPlantMenu()
+    end)
+
+    ClickSelectBtn.MouseButton1Click:Connect(function()
+        clickSelectActive = not clickSelectActive
+        if clickSelectActive then
+            ClickSelectBtn.Text = "CLICK ANY PART IN GAME WORLD..."
+            ClickSelectBtn.BackgroundColor3 = Color3.fromRGB(30, 45, 40)
+            css.Color = THEME_ACCENT
+        else
+            ClickSelectBtn.Text = "Click Select Tool: INACTIVE"
+            ClickSelectBtn.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+            css.Color = Color3.fromRGB(45, 45, 55)
+        end
+    end)
+
+    NightAutomateBtn.MouseButton1Click:Connect(function()
+        waitForNightAutomation = not waitForNightAutomation
+        NightAutomateBtn.BackgroundColor3 = waitForNightAutomation and Color3.fromRGB(60, 220, 60) or Color3.fromRGB(200, 60, 60)
+    end)
+
+    SettingsBtn.MouseButton1Click:Connect(function()
+        settingsOpen = not settingsOpen
+        plantDropdownOpen = false PlantMenuContainer.Visible = false ConfigFiltersBtn.Text = "Configure Filtered Plants... v"
+        stealModeDropdownOpen = false StealModeMenu.Visible = false
+        SettingsPanel.Visible = settingsOpen
+        updateMainWindowHeight()
+    end)
+
+    MinimizeBtn.MouseButton1Click:Connect(function()
+        isMinimized = not isMinimized
+        tpDropdownOpen = false TeleportMenu.Visible = false
+        stealDropdownOpen = false StealMenu.Visible = false
+        stealModeDropdownOpen = false StealModeMenu.Visible = false
+        plantDropdownOpen = false PlantMenuContainer.Visible = false ConfigFiltersBtn.Text = "Configure Filtered Plants... v"
+        settingsOpen = false SettingsPanel.Visible = false
+        TweenService:Create(MainFrame, TweenInfo.new(0.3, Enum.EasingStyle.Quart), {Size = UDim2.new(0, 270, 0, isMinimized and 42 or BASE_HEIGHT)}):Play()
+    end)
+
+    CloseBtn.MouseButton1Click:Connect(function()
+        if renderConnection then renderConnection:Disconnect() end
+        clearAllLabels()
+        ScreenGui:Destroy()
+    end)
+
+    -- GLOBAL CLICK SELECT RAYCAST (from ClickSelectBtn in header)
+    UserInputService.InputBegan:Connect(function(input, processed)
+        if clickSelectActive and not processed then
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                local camera = workspace.CurrentCamera
+                if not camera then clickSelectActive = false return end
+                local ray = camera:ScreenPointToRay(input.Position.X, input.Position.Y)
+                local raycastParams = RaycastParams.new()
+                raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+                raycastParams.FilterDescendantsInstances = {player.Character or workspace}
+                local result = workspace:Raycast(ray.Origin, ray.Direction * 1000, raycastParams)
+                local resolvedSeedName = nil
+                if result and result.Instance then
+                    local hitInstance = result.Instance
+                    if hitInstance:GetAttribute("Height") ~= nil then
+                        local model = hitInstance:FindFirstAncestorOfClass("Model")
+                        if model then resolvedSeedName = model:GetAttribute("SeedName") end
+                    else
+                        local p1 = hitInstance.Parent
+                        local p2 = p1 and p1.Parent
+                        if p2 and p2:GetAttribute("SeedName") ~= nil then
+                            resolvedSeedName = p2:GetAttribute("SeedName")
+                        elseif p1 and p1:GetAttribute("SeedName") ~= nil then
+                            resolvedSeedName = p1:GetAttribute("SeedName")
+                        else
+                            local current = hitInstance
+                            for i = 1, 4 do
+                                if not current or current == workspace then break end
+                                if current:GetAttribute("SeedName") ~= nil then
+                                    resolvedSeedName = current:GetAttribute("SeedName") break
+                                end
+                                current = current.Parent
+                            end
+                        end
+                    end
+                end
+                if resolvedSeedName and PLANT_BASE_WEIGHTS[resolvedSeedName] ~= nil then
+                    selectedPlantsFilter[resolvedSeedName] = true
+                    createTopRightNotify("SCANNER CAPTURED", "Auto-engaged plant toggle: " .. resolvedSeedName, THEME_ACCENT)
+                    if plantDropdownOpen then refreshPlantMenu() end
+                else
+                    createTopRightNotify("SCANNER ERROR", "Object outside structural asset bounds.", Color3.fromRGB(230, 80, 80))
+                end
+                clickSelectActive = false
+                ClickSelectBtn.Text = "Click Select Tool: INACTIVE"
+                ClickSelectBtn.BackgroundColor3 = Color3.fromRGB(28, 28, 36)
+                css.Color = Color3.fromRGB(45, 45, 55)
+            end
+        end
+    end)
+
+    -- FRUIT WATCHER / ESP HOOKER
+    task.spawn(function()
+        local monitoredPlots = {}
+
+        local function setupFruitWatcher(plantModel)
+            local seedName = plantModel:GetAttribute("SeedName") or "Unknown Plant"
+            local fruitsFolder = plantModel:WaitForChild("Fruits", 5) or plantModel:FindFirstChild("Fruits")
+            if not fruitsFolder then return end
+
+            fruitsFolder.ChildAdded:Connect(function(fruit)
+                if not fruitWatcherEnabled then return end
+                task.wait(0.25)
+                local sizeMulti = tonumber(fruit:GetAttribute("SizeMulti")) or 1
+                local mutationType = tostring(fruit:GetAttribute("Mutation") or "Normal")
+                local baseWeight = tonumber(PLANT_BASE_WEIGHTS[seedName]) or 3.00
+                local calcWeight = math.round(baseWeight * sizeMulti)
+                local alertTitle = "[" .. string.upper(mutationType) .. "] MUTATION DETECTED"
+                local alertBody = tostring(seedName) .. " | Multi: " .. tostring(sizeMulti) .. "x | Weight: " .. tostring(calcWeight) .. "kg"
+                createTopRightNotify(alertTitle, alertBody, espColorRGB)
+                pcall(function() applySmoothFadingESP(fruit) end)
+            end)
+        end
+
+        local function checkAndHookPlot(plot)
+            if monitoredPlots[plot] then return end
+            if plot:GetAttribute("Owner") == playerName then
+                monitoredPlots[plot] = true
+                local plants = plot:WaitForChild("Plants", 5)
+                if plants then
+                    for _, p in pairs(plants:GetChildren()) do task.spawn(function() setupFruitWatcher(p) end) end
+                    plants.ChildAdded:Connect(function(np) task.spawn(function() setupFruitWatcher(np) end) end)
+                end
+            end
+        end
+
+        for _, plot in pairs(GARDENS_FOLDER:GetChildren()) do checkAndHookPlot(plot) end
+        GARDENS_FOLDER.ChildAdded:Connect(checkAndHookPlot)
+    end)
+
+    -- SIZEMULTI WATCHER (with notifications instead of print)
+    task.spawn(function()
+        while true do
+            task.wait(0.5)
+            if fruitWatcherEnabled then
+                for _, plot in pairs(GARDENS_FOLDER:GetChildren()) do
+                    if plot:GetAttribute("Owner") == playerName and plot:FindFirstChild("Plants") then
+                        for _, plant in pairs(plot.Plants:GetChildren()) do
+                            if plant:FindFirstChild("Fruits") then
+                                for _, fruit in pairs(plant.Fruits:GetChildren()) do
+                                    local scaleValue = fruit:GetAttribute("SizeMulti") or 1
+                                    if fruit:GetAttribute("PrevTrackedScale") ~= scaleValue then
+                                        fruit:SetAttribute("PrevTrackedScale", scaleValue)
+                                        createTopRightNotify(
+                                            "SIZE CHANGE: " .. tostring(plant.Name),
+                                            "SizeMulti is now: " .. tostring(scaleValue),
+                                            Color3.fromRGB(210, 140, 10)
+                                        )
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+
+    -- HARVEST / STEAL LOGIC
+    local function runAdvancedPacedHarvestSequence(targetPlot)
+        if not isNightOrMoonActive() then return end
+        if not targetPlot or targetPlot.Parent == nil then return end
+        local myPlot = getMyPlot()
+        local plantsFolder = targetPlot:FindFirstChild("Plants")
+        local targetSpawnPoint = targetPlot:FindFirstChild("SpawnPoint")
+        local character = player.Character
+        local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+        if not myPlot or not plantsFolder or not rootPart or not targetSpawnPoint then return end
+        fruitsHarvestedThisRun = 0
+        rootPart.Anchored = false
+        teleportToLocation(targetSpawnPoint.CFrame + Vector3.new(0, 3, 0))
+        task.wait(0.1)
+
+        local keepTeleporting = true
+        task.spawn(function()
+            while keepTeleporting do
+                task.wait(2)
+                if keepTeleporting and cycleStealAllEnabled and targetSpawnPoint then
+                    teleportToLocation(targetSpawnPoint.CFrame + Vector3.new(0, 3, 0))
+                end
+            end
+        end)
+
+        for _, plantModel in pairs(plantsFolder:GetChildren()) do
+            local seedName = plantModel:GetAttribute("SeedName")
+            local allowed = (plantFilterModes[seedName] == "Whitelist" and selectedPlantsFilter[seedName])
+                         or (plantFilterModes[seedName] == "Blacklist" and not selectedPlantsFilter[seedName])
+            if allowed then
+                local fruitsFolder = plantModel:FindFirstChild("Fruits")
+                if fruitsFolder then
+                    local fruits = fruitsFolder:GetChildren()
+
+                    if selectedStealMode == "Steal Best Fruits" then
+                        table.sort(fruits, function(a, b)
+                            return calculateFruitPrices(seedName, a) > calculateFruitPrices(seedName, b)
+                        end)
+                    elseif selectedStealMode == "Steal Only Mutated" then
+                        local filtered = {}
+                        for _, fr in ipairs(fruits) do
+                            if fr:GetAttribute("Mutation") then table.insert(filtered, fr) end
+                        end
+                        fruits = filtered
+                    elseif selectedStealMode == "Steal Heaviest" then
+                        table.sort(fruits, function(a, b)
+                            local wA = (PLANT_BASE_WEIGHTS[seedName] or 1) * (a:GetAttribute("SizeMulti") or 1)
+                            local wB = (PLANT_BASE_WEIGHTS[seedName] or 1) * (b:GetAttribute("SizeMulti") or 1)
+                            return wA > wB
+                        end)
+                    elseif selectedStealMode == "Random Steal" then
+                        for i = #fruits, 2, -1 do
+                            local j = math.random(i)
+                            fruits[i], fruits[j] = fruits[j], fruits[i]
+                        end
+                    end
+                    -- "Steal Normal Fruits" = no sort, as-is
+
+                    for _, fruit in pairs(fruits) do
+                        if not cycleStealAllEnabled then keepTeleporting = false return end
+                        if fruitsHarvestedThisRun >= 50 then break end
+                        local hp = fruit:FindFirstChild("HarvestPart")
+                        local prompt = hp and (hp:FindFirstChild("StealPrompt") or hp:FindFirstChild("HarvestPrompt"))
+                        if prompt and prompt:IsA("ProximityPrompt") then
+                            prompt.MaxActivationDistance = 100
+                            if typeof(fireproximityprompt) == "function" then fireproximityprompt(prompt) end
+                            fruitsHarvestedThisRun = fruitsHarvestedThisRun + 1
+                            StatusLabel.Text = "SYSTEM ENVIRONMENT: RAIDING (" .. fruitsHarvestedThisRun .. "/50)"
+                            task.wait(0.05)
+                        end
+                    end
+                end
+            end
+        end
+
+        keepTeleporting = false
+        executeEscapeToSizeReference()
+        task.wait(0.2)
+        fruitsHarvestedThisRun = 0
+    end
+
+    local function toggleCycleStealAll(forceValue)
+        if forceValue ~= nil then cycleStealAllEnabled = forceValue else cycleStealAllEnabled = not cycleStealAllEnabled end
+        if cycleStealAllEnabled then
+            autoCollectEnabled = false
+            AutoCollectBtn.Text = "Auto Collect: OFF"
+            AutoCollectBtn.BackgroundColor3 = THEME_SURFACE
+            AutoCollectBtn.TextColor3 = THEME_TEXT
+            CycleAllBtn.Text = "CYCLE STEAL ALL MAP: ACTIVE"
+        else
+            CycleAllBtn.Text = "CYCLE STEAL ALL MAP: OFF"
+            local character = player.Character
+            if character and character:FindFirstChild("HumanoidRootPart") then character.HumanoidRootPart.Anchored = false end
+        end
+    end
+
+    CycleAllBtn.MouseButton1Click:Connect(function()
+        if not cycleStealAllEnabled and not isNightOrMoonActive() and not waitForNightAutomation then
+            showTopWarningNotification() return
+        end
+        toggleCycleStealAll()
+    end)
+
+    -- AUTO COLLECT LOOP (with whitelist/blacklist and steal mode)
+    task.spawn(function()
+        while true do
+            task.wait(0.3)
+            if autoCollectEnabled then
+                local myPlot = getMyPlot()
+                local plantsFolder = myPlot and myPlot:FindFirstChild("Plants")
+                if plantsFolder then
+                    for _, plantModel in pairs(plantsFolder:GetChildren()) do
+                        local seedName = plantModel:GetAttribute("SeedName")
+                        local allowed = (plantFilterModes[seedName] == "Whitelist" and selectedPlantsFilter[seedName])
+                                     or (plantFilterModes[seedName] == "Blacklist" and not selectedPlantsFilter[seedName])
+                        if allowed and plantModel:FindFirstChild("Fruits") then
+                            local fruits = plantModel.Fruits:GetChildren()
+
+                            if selectedStealMode == "Steal Best Fruits" then
+                                table.sort(fruits, function(a, b)
+                                    return calculateFruitPrices(seedName, a) > calculateFruitPrices(seedName, b)
+                                end)
+                            elseif selectedStealMode == "Steal Only Mutated" then
+                                local filtered = {}
+                                for _, fr in ipairs(fruits) do
+                                    if fr:GetAttribute("Mutation") then table.insert(filtered, fr) end
+                                end
+                                fruits = filtered
+                            elseif selectedStealMode == "Steal Heaviest" then
+                                table.sort(fruits, function(a, b)
+                                    local wA = (PLANT_BASE_WEIGHTS[seedName] or 1) * (a:GetAttribute("SizeMulti") or 1)
+                                    local wB = (PLANT_BASE_WEIGHTS[seedName] or 1) * (b:GetAttribute("SizeMulti") or 1)
+                                    return wA > wB
+                                end)
+                            elseif selectedStealMode == "Random Steal" then
+                                for i = #fruits, 2, -1 do
+                                    local j = math.random(i)
+                                    fruits[i], fruits[j] = fruits[j], fruits[i]
+                                end
+                            end
+
+                            for _, fruit in pairs(fruits) do
+                                if not autoCollectEnabled then break end
+                                local hp = fruit:FindFirstChild("HarvestPart")
+                                local prompt = hp and hp:FindFirstChild("HarvestPrompt")
+                                if prompt and prompt:IsA("ProximityPrompt") then
+                                    prompt.MaxActivationDistance = 1000
+                                    if typeof(fireproximityprompt) == "function" then fireproximityprompt(prompt) end
+                                    task.wait(0.08)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+
+    -- SELL SEQUENCE
+    local function executeSellSequence()
+        local character = player.Character
+        if character and character:FindFirstChild("HumanoidRootPart") then character.HumanoidRootPart.Anchored = false end
+        local sellTp = TELEPORTS_FOLDER:FindFirstChild("Sell")
+        if sellTp then teleportToLocation(sellTp.CFrame + Vector3.new(0, 8, 0)) end
+        task.wait(0.2)
+        local prompt = Workspace.NPCS.Steven.HumanoidRootPart:FindFirstChildOfClass("ProximityPrompt")
+        if prompt and typeof(fireproximityprompt) == "function" then fireproximityprompt(prompt) end
+
+        local objectsFolder = nil
+        for i = 1, 15 do
+            objectsFolder = playerGui:FindFirstChild("Billboard_UI") and playerGui.Billboard_UI:FindFirstChild("Objects")
+            if objectsFolder and objectsFolder:FindFirstChild("Option_UI") then break end
+            task.wait(0.1)
+        end
+
+        if objectsFolder then
+            for _, objUI in pairs(objectsFolder:GetChildren()) do
+                if objUI.Name == "Option_UI" then
+                    local lbl = byPassWaitForChild(objUI, "Frame.Frame.TextLabel", 2)
+                    if lbl and lbl.Text == "#1" then
+                        local btn = objUI.Frame:FindFirstChild("ImageButton")
+                        if btn then clickImageButton(btn) break end
+                    end
+                end
+            end
+        end
+        task.wait(1.2)
+        executeEscapeToSizeReference()
+    end
+
+    local function checkInventoryFull()
+        local invLabel = byPassWaitForChild(playerGui, "BackpackGui.Backpack.Inventory.FruitInventory", 2)
+        return invLabel and invLabel.Text == "100/100 Fruits"
+    end
+
+    -- SERVER HOP LOOP
+    task.spawn(function()
+        while true do
+            if cycleStealAllEnabled and not isNightOrMoonActive() then
+                createTopRightNotify("CYCLE COMPLETED / EXPIRED", "Daybreak detected. Cross-server displacement initiating...", THEME_ACCENT)
+                task.wait(1)
+                serverHop()
+            end
+            task.wait(3)
+        end
+    end)
+
+    -- AUTO SELL LOOP
+    task.spawn(function()
+        while true do
+            if autoSellEnabled and not cycleStealAllEnabled and checkInventoryFull() then pcall(executeSellSequence) end
+            task.wait(1)
+        end
+    end)
+
+    -- MAIN AUTOMATION LOOP
+    task.spawn(function()
+        while true do
+            if not autoCollectEnabled then
+                if waitForNightAutomation and not cycleStealAllEnabled and isNightOrMoonActive() then
+                    toggleCycleStealAll(true)
+                end
+                if cycleStealAllEnabled then
+                    if not isNightOrMoonActive() then
+                        toggleCycleStealAll(false)
+                        if not waitForNightAutomation then
+                            stealTargetOnlyEnabled = false
+                            StealTargetOnlyBtn.Text = "Auto Steal Target: OFF"
+                            StealTargetOnlyBtn.BackgroundColor3 = THEME_SURFACE
+                        end
+                    elseif stealTargetOnlyEnabled and targetStealPlot then
+                        pcall(function() runAdvancedPacedHarvestSequence(targetStealPlot) end)
+                        task.wait(0.5)
+                    else
+                        local tf = false
+                        for _, plot in pairs(GARDENS_FOLDER:GetChildren()) do
+                            local oName = plot:GetAttribute("Owner")
+                            if oName and oName ~= playerName then
+                                tf = true
+                                pcall(function() runAdvancedPacedHarvestSequence(plot) end)
+                                task.wait(0.5)
+                            end
+                        end
+                        if not tf then task.wait(1) end
+                    end
+                else
+                    task.wait(0.2)
+                end
+            else
+                if autoSellEnabled and checkInventoryFull() then pcall(executeSellSequence) end
+                task.wait(0.05)
+            end
+        end
+    end)
+end
+
+YesBtn.MouseButton1Click:Connect(function() launchMainScript(true) end)
+NoBtn.MouseButton1Click:Connect(function() launchMainScript(false) end)
+PXBtn.MouseButton1Click:Connect(function() launchMainScript(false) end)
